@@ -215,12 +215,6 @@ const createRoom = async () => {
   }
 
   try {
-    // const response = await fetch('/api/create-room')
-    // if (!response.ok) {
-    //   throw new Error('Failed to create room')
-    // }
-    // const data = await response.json()
-    // router.push({ path: `/${data.roomId}`, query: { name: userName.value } })
     socket.emit('create-room')
   } catch (error) {
     console.error('Create room error:', error)

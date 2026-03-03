@@ -151,12 +151,10 @@ io.on('connection', (socket) => {
 
   // Remote Control Signaling
   socket.on('request-control', ({ targetId }) => {
-    console.log(`Control request from ${socket.id} to ${targetId}`)
     io.to(targetId).emit('request-control', { requesterId: socket.id })
   })
 
   socket.on('accept-control', ({ requesterId }) => {
-    console.log(`Control accepted by ${socket.id} for ${requesterId}`)
     io.to(requesterId).emit('accept-control', { accepterId: socket.id })
   })
 
