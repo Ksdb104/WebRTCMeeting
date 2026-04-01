@@ -256,6 +256,28 @@ export function useWebRTC(roomId: string, userName: string) {
     }
   }
 
+  // 优化屏幕共享发送端参数，提高画质和流畅度
+  const optimizeScreenSender = (sender: RTCRtpSender) => {
+    try {
+      const params = sender.getParameters()
+      if (!params.encodings || params.encodings.length === 0) {
+        params.encodings = [{}]
+      }
+
+      // 提高码率上限到 8Mbps 保证画质和流畅度 (WebRTC 默认对屏幕共享限制较低)
+      if (params.encodings && params.encodings[0]) {
+        params.encodings[0].maxBitrate = 8000000
+      }
+      // 追求流畅度，设置 degradePreference 为 balanced 或 maintain-framerate
+      // 这样在网络波动时会权衡帧率和分辨率，而不会像默认那样死保分辨率导致卡顿严重
+      params.degradationPreference = 'balanced'
+
+      sender.setParameters(params).catch((e) => console.warn('Set sender parameters failed:', e))
+    } catch (e) {
+      console.warn('Optimize screen sender failed:', e)
+    }
+  }
+
   const createPeerConnection = async (targetId: string, isInitiator: boolean) => {
     if (peers.has(targetId)) return peers.get(targetId)
 
@@ -295,9 +317,12 @@ export function useWebRTC(roomId: string, userName: string) {
     })
 
     // 如果正在屏幕共享，也添加屏幕流
-    if (localScreenStream.value) {
-      localScreenStream.value.getTracks().forEach((track) => {
-        pc.addTrack(track, localScreenStream.value!)
+    if (localScreenShareFinalStream.value) {
+      localScreenShareFinalStream.value.getTracks().forEach((track) => {
+        const sender = pc.addTrack(track, localScreenShareFinalStream.value!)
+        if (track.kind === 'video') {
+          optimizeScreenSender(sender)
+        }
       })
     }
 
@@ -718,9 +743,23 @@ export function useWebRTC(roomId: string, userName: string) {
 
     try {
       const stream = await navigator.mediaDevices.getDisplayMedia({
-        video: true,
-        audio: true,
+        video: {
+          // @ts-expect-error resizeMode 用于解决 HDR 屏幕共享发白及缩放导致的高延迟问题
+          resizeMode: 'none',
+          frameRate: { ideal: 30, max: 60 },
+        },
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+        },
       })
+
+      const videoTrack = stream.getVideoTracks()[0]
+      if (videoTrack) {
+        videoTrack.contentHint = 'detail' // 优化文字等细节展示，降低模糊带来的延迟感
+      }
+
       localScreenStream.value = stream
       localUser.isScreenSharing = true
       // socket.value?.emit('update-status', { roomId, status: { isScreenSharing: true } }) // 延迟到后面带 ID 发送
@@ -771,7 +810,10 @@ export function useWebRTC(roomId: string, userName: string) {
       // 添加到 Peers
       peers.forEach((pc) => {
         finalStream.getTracks().forEach((track) => {
-          pc.addTrack(track, finalStream)
+          const sender = pc.addTrack(track, finalStream)
+          if (track.kind === 'video') {
+            optimizeScreenSender(sender)
+          }
         })
         // addTrack 会触发 onnegotiationneeded，前提是我们在 createPeerConnection 中设置了监听
       })
