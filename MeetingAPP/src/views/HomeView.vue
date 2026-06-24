@@ -130,13 +130,15 @@
         <!-- Status Indicator -->
         <div class="pt-6">
           <div class="flex items-center justify-center gap-2 text-sm">
+            <!-- Green indicator (connected) -->
             <div
-              :class="[
-                'w-2 h-2 rounded-full transition-all duration-300',
-                isConnected
-                  ? 'bg-green-500 shadow-[0_0_10px_rgba(34,197,94,0.8)] animate-pulse'
-                  : 'bg-red-500 shadow-[0_0_10px_rgba(239,68,68,0.8)]',
-              ]"
+              v-if="isConnected"
+              class="w-2 h-2 rounded-full bg-green-500 shadow-[0_0_10px_rgba(34,197,94,0.8)] animate-pulse"
+            ></div>
+            <!-- Red indicator (disconnected) -->
+            <div
+              v-else
+              class="w-2 h-2 rounded-full bg-red-500 shadow-[0_0_10px_rgba(239,68,68,0.8)]"
             ></div>
             <span :class="isConnected ? 'text-green-400' : 'text-red-400'" class="font-medium">
               {{ status }}
