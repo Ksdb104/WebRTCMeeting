@@ -17,12 +17,38 @@
       ></div>
     </div>
 
+    <!-- GitHub Link -->
+    <a
+      href="https://github.com/Ksdb104/WebRTCMeeting"
+      target="_blank"
+      rel="noopener noreferrer"
+      class="fixed top-4 right-32 sm:top-6 sm:right-34 z-50 p-3 bg-white/10 backdrop-blur-md rounded-full hover:bg-white/20 transition-all duration-200 border border-white/10 shadow-lg hover:shadow-xl cursor-pointer group"
+      title="GitHub"
+      aria-label="GitHub"
+    >
+      <svg class="w-5 h-5 text-white" viewBox="0 0 24 24" fill="currentColor">
+        <path
+          d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"
+        />
+      </svg>
+    </a>
+
+    <!-- Language Switcher -->
+    <button
+      @click="toggleLocale"
+      class="w-11.5 h-11.5 flex items-center justify-center fixed top-4 right-18 sm:top-6 sm:right-20 z-50 p-3 bg-white/10 backdrop-blur-md rounded-full hover:bg-white/20 transition-all duration-200 border border-white/10 shadow-lg hover:shadow-xl cursor-pointer group"
+      :title="locale === 'zh' ? 'Switch to English' : '切换为中文'"
+      aria-label="Switch language"
+    >
+      <span class="text-sm font-bold text-white">{{ locale === 'zh' ? 'EN' : '中' }}</span>
+    </button>
+
     <!-- Settings Button -->
     <button
       @click="showSettings = true"
       class="fixed top-4 right-4 sm:top-6 sm:right-6 z-50 p-3 bg-white/10 backdrop-blur-md rounded-full hover:bg-white/20 transition-all duration-200 border border-white/10 shadow-lg hover:shadow-xl cursor-pointer group"
-      title="AI 设置"
-      aria-label="打开AI设置"
+      :title="t('home.aiSettings')"
+      :aria-label="t('home.aiSettings')"
     >
       <Settings
         class="w-5 h-5 text-white group-hover:rotate-90 transition-transform duration-300"
@@ -48,16 +74,15 @@
           <h1
             class="text-3xl sm:text-4xl sm:leading-12 font-bold mb-3 bg-linear-to-r from-blue-400 via-cyan-400 to-purple-400 bg-clip-text text-transparent"
           >
-            WebRTC Meeting
+            {{ t('home.title') }}
           </h1>
-          <!-- <p class="text-gray-300 text-sm sm:text-base">安全、实时、无缝的音视频会议体验</p> -->
         </div>
 
         <!-- Form -->
         <div class="space-y-4">
           <!-- Name Input -->
           <div class="relative group">
-            <label for="userName" class="sr-only">您的名字</label>
+            <label for="userName" class="sr-only">{{ t('home.namePlaceholder') }}</label>
             <div
               class="absolute left-4 top-1/2 -translate-y-1/2 text-gray-400 group-focus-within:text-blue-400 transition-colors duration-200"
             >
@@ -67,7 +92,7 @@
               id="userName"
               v-model="userName"
               type="text"
-              placeholder="输入您的名字"
+              :placeholder="t('home.namePlaceholder')"
               class="w-full bg-white/5 border border-white/10 rounded-xl pl-12 pr-4 py-3.5 text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500/50 focus:bg-white/10 focus:border-white/20 transition-all duration-200"
               required
               autocomplete="off"
@@ -76,7 +101,7 @@
 
           <!-- Room ID Input -->
           <div class="relative group">
-            <label for="roomId" class="sr-only">房间码</label>
+            <label for="roomId" class="sr-only">{{ t('home.roomIdPlaceholder') }}</label>
             <div
               class="absolute left-4 top-1/2 -translate-y-1/2 text-gray-400 group-focus-within:text-blue-400 transition-colors duration-200"
             >
@@ -86,7 +111,7 @@
               id="roomId"
               v-model="roomId"
               type="text"
-              placeholder="输入房间码（可选）"
+              :placeholder="t('home.roomIdPlaceholder')"
               class="uppercase w-full bg-white/5 border border-white/10 rounded-xl pl-12 pr-4 py-3.5 text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500/50 focus:bg-white/10 focus:border-white/20 transition-all duration-200"
               @keyup.enter="joinRoom"
             />
@@ -97,21 +122,18 @@
             @click="createRoom"
             :disabled="!userName || !isConnected"
             class="w-full py-3.5 px-4 bg-linear-to-r from-blue-600 to-blue-700 hover:from-blue-500 hover:to-blue-600 rounded-xl font-semibold transition-all duration-200 flex items-center justify-center gap-2 group shadow-lg shadow-blue-500/30 hover:shadow-blue-500/50 cursor-pointer text-white"
-            aria-label="创建房间"
+            :aria-label="t('home.createRoom')"
           >
             <PlusCircle
               class="w-5 h-5 transition-transform duration-200 group-hover:scale-110 group-hover:rotate-90"
             />
-            创建房间
+            {{ t('home.createRoom') }}
           </button>
 
           <!-- Divider -->
           <div class="relative">
-            <!-- <div class="absolute inset-0 flex items-center">
-              <div class="w-full border-t border-white/10"></div>
-            </div> -->
             <div class="relative flex justify-center">
-              <span class="px-3 text-sm text-gray-400 bg-transparent">或者</span>
+              <span class="px-3 text-sm text-gray-400 bg-transparent">{{ t('home.or') }}</span>
             </div>
           </div>
 
@@ -120,10 +142,10 @@
             @click="joinRoom"
             :disabled="!roomId || !userName || !isConnected"
             class="w-full py-3.5 px-4 bg-white/5 hover:bg-white/10 disabled:opacity-40 disabled:cursor-not-allowed rounded-xl font-semibold transition-all duration-200 flex items-center justify-center gap-2 border border-white/10 hover:border-white/20 cursor-pointer text-white disabled:hover:bg-white/5 disabled:hover:border-white/10"
-            aria-label="加入房间"
+            :aria-label="t('home.joinRoom')"
           >
             <LogIn class="w-5 h-5" />
-            加入房间
+            {{ t('home.joinRoom') }}
           </button>
         </div>
 
@@ -151,19 +173,40 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, onMounted, onUnmounted, computed } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { PlusCircle, LogIn, Hash, User as UserIcon, Settings, Video } from 'lucide-vue-next'
 import { io, type Socket } from 'socket.io-client'
+import { useI18n } from 'vue-i18n'
 import SettingsModal from '@/components/SettingsModal.vue'
 const wsURL = import.meta.env.VITE_WS_URL
+
+const { t, locale } = useI18n()
+
+const toggleLocale = () => {
+  locale.value = locale.value === 'zh' ? 'en' : 'zh'
+  localStorage.setItem('app_locale', locale.value)
+}
 
 const router = useRouter()
 const route = useRoute()
 const roomId = ref('')
 const userName = ref('')
-const status = ref('正在连接服务器...')
+const connectionState = ref<'connecting' | 'connected' | 'failed' | 'disconnected'>('connecting')
 const isConnected = ref(false)
+
+const status = computed(() => {
+  switch (connectionState.value) {
+    case 'connecting':
+      return t('home.connecting')
+    case 'connected':
+      return t('home.connected')
+    case 'failed':
+      return t('home.connectFailed')
+    case 'disconnected':
+      return t('home.disconnected')
+  }
+})
 
 // Settings
 const showSettings = ref(false)
@@ -183,25 +226,25 @@ onMounted(() => {
 
   socket.on('connect', () => {
     isConnected.value = true
-    status.value = '服务器已连接'
+    connectionState.value = 'connected'
   })
 
   socket.on('connect_error', (err) => {
     console.error('Socket connection error:', err)
     isConnected.value = false
-    status.value = '连接失败'
+    connectionState.value = 'failed'
   })
 
   socket.on('disconnect', () => {
     isConnected.value = false
-    status.value = '服务器断开连接'
+    connectionState.value = 'disconnected'
   })
 
   socket.on('room-created', (data) => {
     if (data.status) {
       router.push({ path: `/${data.roomId}`, query: { name: userName.value } })
     } else {
-      alert('创建房间失败: ' + data.error)
+      alert(t('home.createFailedWithError', { error: data.error }))
     }
   })
 })
@@ -212,7 +255,7 @@ onUnmounted(() => {
 
 const createRoom = async () => {
   if (!userName.value) {
-    alert('请输入您的名字')
+    alert(t('home.nameRequired'))
     return
   }
 
@@ -220,7 +263,7 @@ const createRoom = async () => {
     socket.emit('create-room')
   } catch (error) {
     console.error('Create room error:', error)
-    alert('创建房间失败，请重试')
+    alert(t('home.createFailed'))
   }
 }
 

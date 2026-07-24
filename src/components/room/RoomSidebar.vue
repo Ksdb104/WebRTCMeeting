@@ -9,8 +9,11 @@
       :localUser="localUser"
       :chatMessages="chatMessages"
       :activeTab="activeTab"
+      :interpretingUsers="interpretingUsers"
+      :receivingInterpretation="receivingInterpretation"
       @sendMessage="onSendMessage"
       @update:activeTab="emit('update:activeTab', $event)"
+      @toggleInterpretation="emit('toggleInterpretation', $event)"
     />
   </div>
 
@@ -30,8 +33,11 @@
         :localUser="localUser"
         :chatMessages="chatMessages"
         :activeTab="activeTab"
+        :interpretingUsers="interpretingUsers"
+        :receivingInterpretation="receivingInterpretation"
         @sendMessage="onSendMessage"
         @update:activeTab="emit('update:activeTab', $event)"
+        @toggleInterpretation="emit('toggleInterpretation', $event)"
       />
     </div>
   </div>
@@ -58,12 +64,15 @@ defineProps<{
   localUser: User
   chatMessages: ChatMessage[]
   activeTab: string
+  interpretingUsers?: Set<string>
+  receivingInterpretation?: Set<string>
 }>()
 
 const emit = defineEmits<{
   (e: 'update:mobileShow', value: boolean): void
   (e: 'sendMessage', content: string): void
   (e: 'update:activeTab', value: string): void
+  (e: 'toggleInterpretation', userId: string): void
 }>()
 
 const onSendMessage = (content: string) => {

@@ -1,8 +1,33 @@
 import express from 'express'
 import { createServer } from 'node:http'
+import { readFileSync } from 'node:fs'
+import { resolve, dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { Server } from 'socket.io'
+import { GoogleGenAI } from '@google/genai'
+
+// 加载 .env 文件（简单实现，无需额外依赖）
+const __dirname = dirname(fileURLToPath(import.meta.url))
+try {
+  const envPath = resolve(__dirname, '..', '.env.server')
+  const envContent = readFileSync(envPath, 'utf-8')
+  envContent.split('\n').forEach((line) => {
+    const trimmed = line.trim()
+    if (trimmed && !trimmed.startsWith('#')) {
+      const [key, ...valueParts] = trimmed.split('=')
+      const value = valueParts.join('=').replace(/^['"]|['"]$/g, '')
+      if (key && !process.env[key]) {
+        process.env[key] = value
+      }
+    }
+  })
+} catch {
+  // .env.server 文件不存在，跳过
+}
 
 const app = express()
+app.use(express.json())
+
 const httpServer = createServer(app)
 const io = new Server(httpServer, {
   cors: {
@@ -10,6 +35,27 @@ const io = new Server(httpServer, {
     methods: ['GET', 'POST'],
   },
 })
+
+// ====== Gemini SDK ======
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || ''
+let genaiClient = null
+if (GEMINI_API_KEY) {
+  genaiClient = new GoogleGenAI({ apiKey: GEMINI_API_KEY, httpOptions: { apiVersion: 'v1alpha' } })
+  console.log('Gemini SDK initialized')
+} else {
+  console.warn('GEMINI_API_KEY not configured, interpretation will not work')
+}
+
+function getErrorDetails(error) {
+  const details = []
+  let current = error
+  while (current && details.length < 3) {
+    const message = current.message || String(current)
+    if (message && !details.includes(message)) details.push(message)
+    current = current.cause
+  }
+  return details.join(': ')
+}
 
 // 房间列表
 // key: roomId, value: Map<socketId, UserInfo>
@@ -160,6 +206,80 @@ io.on('connection', (socket) => {
 
   socket.on('reject-control', ({ requesterId }) => {
     io.to(requesterId).emit('reject-control', { rejecterId: socket.id })
+  })
+
+  // ====== 同传信令 ======
+  // 请求 Gemini 临时令牌（仅已连接用户可调用）
+  socket.on('request-gemini-token', async ({ targetLanguage }, callback) => {
+    if (!genaiClient) {
+      console.error('Gemini SDK not initialized')
+      callback({ error: 'Gemini not configured on server' })
+      return
+    }
+
+    // 验证用户确实在某个房间内
+    const userRooms = [...socket.rooms].filter((r) => r !== socket.id)
+    if (userRooms.length === 0) {
+      callback({ error: 'Not in any room' })
+      return
+    }
+
+    try {
+      console.log(`Requesting Gemini token for language: ${targetLanguage}`)
+
+      const now = new Date()
+      const expireTime = new Date(now.getTime() + 30 * 60 * 1000)
+      const newSessionExpireTime = new Date(now.getTime() + 2 * 60 * 1000)
+
+      const token = await genaiClient.authTokens.create({
+        config: {
+          uses: 1,
+          expireTime: expireTime.toISOString(),
+          newSessionExpireTime: newSessionExpireTime.toISOString(),
+          httpOptions: { apiVersion: 'v1alpha' },
+        },
+      })
+
+      console.log('Gemini token created successfully')
+      // token.name 格式为 "auth_tokens/xxx"，客户端需要完整值
+      callback({ token: token.name, expiresAt: token.expireTime })
+    } catch (error) {
+      const errorDetails = getErrorDetails(error) || 'Unknown error'
+      console.error('Failed to create Gemini ephemeral token:', errorDetails)
+      callback({ error: `Token creation failed: ${errorDetails}` })
+    }
+  })
+
+  // 发送方请求开启同传（通知目标用户）
+  socket.on('interpretation-request', ({ targetId, targetLanguage }) => {
+    io.to(targetId).emit('interpretation-request', {
+      requesterId: socket.id,
+      targetLanguage,
+    })
+  })
+
+  // 目标用户接受同传
+  socket.on('interpretation-accept', ({ requesterId }) => {
+    io.to(requesterId).emit('interpretation-accept', { accepterId: socket.id })
+  })
+
+  // 发送方完成译音轨道替换后，通知接收方启用远端音频轨道
+  socket.on('interpretation-audio-ready', ({ targetId }) => {
+    io.to(targetId).emit('interpretation-audio-ready', { senderId: socket.id })
+  })
+
+  // 任意一方关闭同传
+  socket.on('interpretation-stop', ({ targetId }) => {
+    io.to(targetId).emit('interpretation-stop', { senderId: socket.id })
+  })
+
+  // 转发同传转录文本（可选，用于字幕显示）
+  socket.on('interpretation-transcript', ({ targetId, inputText, outputText }) => {
+    io.to(targetId).emit('interpretation-transcript', {
+      senderId: socket.id,
+      inputText,
+      outputText,
+    })
   })
 
   // 聊天消息

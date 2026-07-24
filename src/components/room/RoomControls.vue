@@ -10,7 +10,7 @@
           class="flex items-center gap-2 group cursor-pointer bg-white/5 px-2 py-1 rounded hover:bg-white/10"
           @click="copyRoomId"
         >
-          <span class="text-xs text-gray-400">房间码:</span>
+          <span class="text-xs text-gray-400">{{ t('room.roomCode') }}</span>
           <span class="font-mono text-sm font-bold text-white">{{ roomId }}</span>
           <Copy class="w-3 h-3 text-gray-500 group-hover:text-blue-400" />
         </div>
@@ -18,8 +18,10 @@
           class="flex items-center gap-2 group cursor-pointer bg-white/5 px-2 py-1 rounded hover:bg-white/10"
           @click="copyLink"
         >
-          <span class="text-xs text-gray-400">链接:</span>
-          <span class="font-mono text-xs text-white truncate max-w-25">点击复制</span>
+          <span class="text-xs text-gray-400">{{ t('room.link') }}</span>
+          <span class="font-mono text-xs text-white truncate max-w-25">{{
+            t('room.clickToCopy')
+          }}</span>
           <Link class="w-3 h-3 text-gray-500 group-hover:text-blue-400" />
         </div>
       </div>
@@ -171,6 +173,9 @@ import {
 import type { User } from '@/composables/useWebRTC'
 import { useDeviceStore } from '@/stores/device'
 import { storeToRefs } from 'pinia'
+import { useI18n } from 'vue-i18n'
+
+const { t } = useI18n()
 
 const props = defineProps<{
   localUser: User
@@ -200,11 +205,11 @@ const { isIOS } = storeToRefs(deviceStore)
 const copyLink = () => {
   const url = `${window.location.origin}/${props.roomId}`
   navigator.clipboard.writeText(url)
-  alert('链接已复制')
+  alert(t('room.linkCopied'))
 }
 
 const copyRoomId = () => {
   navigator.clipboard.writeText(props.roomId)
-  alert('房间码已复制')
+  alert(t('room.roomIdCopied'))
 }
 </script>

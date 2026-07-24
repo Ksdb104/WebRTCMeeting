@@ -90,6 +90,132 @@ export function useWebRTC(roomId: string, userName: string) {
   const controlChannels = new Map<string, RTCDataChannel>()
   const controlMotionChannels = new Map<string, RTCDataChannel>()
   const controllingUserId = ref<string | null>(null)
+
+  // ====== Peer Audio Track Override (同传用) ======
+  interface PeerAudioTrackOverride {
+    track: MediaStreamTrack | null
+    sender: RTCRtpSender | null
+    originalMaxBitrates: Array<number | undefined> | null
+  }
+  const peerAudioTrackOverrides = new Map<string, PeerAudioTrackOverride>()
+  const peerAudioTrackOperations = new Map<string, Promise<unknown>>()
+
+  const enqueuePeerAudioTrackOperation = <T>(
+    targetId: string,
+    operation: () => Promise<T> | T,
+  ): Promise<T> => {
+    const previousOperation = peerAudioTrackOperations.get(targetId) ?? Promise.resolve()
+    const currentOperation = previousOperation.catch(() => undefined).then(operation)
+    peerAudioTrackOperations.set(targetId, currentOperation)
+    void currentOperation
+      .finally(() => {
+        if (peerAudioTrackOperations.get(targetId) === currentOperation) {
+          peerAudioTrackOperations.delete(targetId)
+        }
+      })
+      .catch(() => undefined)
+    return currentOperation
+  }
+
+  const getDefaultOutgoingAudio = () => {
+    const screenAudioTrack = localScreenShareFinalStream.value?.getAudioTracks()[0]
+    if (localUser.isScreenSharing && screenAudioTrack?.readyState === 'live') {
+      return { track: screenAudioTrack, stream: localScreenShareFinalStream.value! }
+    }
+
+    const microphoneTrack = originLocalStream.getAudioTracks()[0]
+    if (microphoneTrack?.readyState === 'live') {
+      return { track: microphoneTrack, stream: originLocalStream }
+    }
+
+    return null
+  }
+
+  const reservePeerAudioTrackOverride = (targetId: string) => {
+    if (!peerAudioTrackOverrides.has(targetId)) {
+      peerAudioTrackOverrides.set(targetId, {
+        track: null,
+        sender: null,
+        originalMaxBitrates: null,
+      })
+    }
+  }
+
+  const setPeerAudioTrackOverride = async (targetId: string, track: MediaStreamTrack) => {
+    reservePeerAudioTrackOverride(targetId)
+    const override = peerAudioTrackOverrides.get(targetId)!
+    override.track = track
+
+    return enqueuePeerAudioTrackOperation(targetId, async () => {
+      const pc = peers.get(targetId)
+      if (!pc) return null
+
+      const defaultAudio = getDefaultOutgoingAudio()
+      let sender = override.sender
+      if (sender && !pc.getSenders().includes(sender)) sender = null
+      if (!sender && defaultAudio) {
+        sender = pc.getSenders().find((candidate) => candidate.track === defaultAudio.track) ?? null
+      }
+
+      if (sender) {
+        if (!override.originalMaxBitrates) {
+          override.originalMaxBitrates = sender
+            .getParameters()
+            .encodings.map((encoding) => encoding.maxBitrate)
+        }
+        await sender.replaceTrack(track)
+      } else {
+        sender = pc.addTrack(track, originLocalStream)
+        override.originalMaxBitrates = sender
+          .getParameters()
+          .encodings.map((encoding) => encoding.maxBitrate)
+      }
+
+      override.sender = sender
+      return sender
+    })
+  }
+
+  const clearPeerAudioTrackOverride = async (targetId: string) => {
+    const override = peerAudioTrackOverrides.get(targetId)
+    peerAudioTrackOverrides.delete(targetId)
+    if (!override) return
+
+    return enqueuePeerAudioTrackOperation(targetId, async () => {
+      const pc = peers.get(targetId)
+      if (!pc) return
+
+      const defaultAudio = getDefaultOutgoingAudio()
+      const sender = override.sender
+      const existingDefaultSender = defaultAudio
+        ? pc.getSenders().find((candidate) => candidate.track === defaultAudio.track)
+        : undefined
+
+      if (sender && pc.getSenders().includes(sender)) {
+        if (existingDefaultSender && existingDefaultSender !== sender) {
+          pc.removeTrack(sender)
+        } else if (defaultAudio) {
+          await sender.replaceTrack(defaultAudio.track)
+          const parameters = sender.getParameters()
+          if (parameters.encodings?.length && override.originalMaxBitrates) {
+            parameters.encodings.forEach((encoding, index) => {
+              const originalMaxBitrate = override.originalMaxBitrates![index]
+              if (originalMaxBitrate === undefined) delete encoding.maxBitrate
+              else encoding.maxBitrate = originalMaxBitrate
+            })
+            await sender.setParameters(parameters)
+          }
+        } else {
+          pc.removeTrack(sender)
+        }
+      } else if (defaultAudio && !existingDefaultSender) {
+        pc.addTrack(defaultAudio.track, defaultAudio.stream)
+      }
+    })
+  }
+
+  const isPeerAudioTrackOverridden = (targetId: string) => peerAudioTrackOverrides.has(targetId)
+
   const wsURL = import.meta.env.VITE_WS_URL
 
   // 初始化
@@ -531,7 +657,8 @@ export function useWebRTC(roomId: string, userName: string) {
             micSourceNode.connect(mixingDestination)
           } else {
             // 独立发送
-            peers.forEach((pc) => {
+            peers.forEach((pc, targetId) => {
+              if (isPeerAudioTrackOverridden(targetId)) return
               pc.addTrack(audioTrack, originLocalStream)
             })
           }
@@ -774,7 +901,8 @@ export function useWebRTC(roomId: string, userName: string) {
         const audioTrack = localStream.value.getAudioTracks()[0]
         if (audioTrack) {
           // 移除独立发送器，转为混音发送
-          peers.forEach((pc) => {
+          peers.forEach((pc, targetId) => {
+            if (isPeerAudioTrackOverridden(targetId)) return
             const sender = pc.getSenders().find((s) => s.track === audioTrack)
             if (sender) pc.removeTrack(sender)
           })
@@ -808,8 +936,9 @@ export function useWebRTC(roomId: string, userName: string) {
       })
 
       // 添加到 Peers
-      peers.forEach((pc) => {
+      peers.forEach((pc, targetId) => {
         finalStream.getTracks().forEach((track) => {
+          if (track.kind === 'audio' && isPeerAudioTrackOverridden(targetId)) return
           const sender = pc.addTrack(track, finalStream)
           if (track.kind === 'video') {
             optimizeScreenSender(sender)
@@ -882,7 +1011,8 @@ export function useWebRTC(roomId: string, userName: string) {
       if (localUser.micOpen && localStream.value) {
         const audioTrack = localStream.value.getAudioTracks()[0]
         if (audioTrack && audioTrack.readyState === 'live') {
-          peers.forEach((pc) => {
+          peers.forEach((pc, targetId) => {
+            if (isPeerAudioTrackOverridden(targetId)) return
             pc.addTrack(audioTrack, originLocalStream)
           })
         }
@@ -1064,6 +1194,9 @@ export function useWebRTC(roomId: string, userName: string) {
     localStream,
     localScreenStream,
     socket,
+    reservePeerAudioTrackOverride,
+    setPeerAudioTrackOverride,
+    clearPeerAudioTrackOverride,
     init,
     toggleMic,
     toggleCam,

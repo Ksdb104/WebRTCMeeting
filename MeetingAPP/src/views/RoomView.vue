@@ -43,7 +43,7 @@
             <VideoPlayer
               v-if="!swappedViews.has(user.id)"
               :stream="getScreenStream(user)"
-              :name="user.name + ' 的屏幕'"
+              :name="t('room.screenOf', { name: user.name })"
               :micOpen="user.micOpen"
               :muted="user.id === localUser.id"
               :sreenStream="true"
@@ -67,7 +67,7 @@
               v-if="user.camOpen"
               class="absolute top-4 right-4 w-1/4 aspect-video bg-black rounded-xl overflow-hidden border border-white/20 shadow-xl z-10 min-w-30 cursor-pointer hover:border-blue-500 hover:shadow-blue-500/20 transition-all"
               @click.stop="toggleView(user.id)"
-              title="点击切换大小视图"
+              :title="t('room.clickToSwapView')"
             >
               <VideoPlayer
                 v-if="!swappedViews.has(user.id)"
@@ -82,7 +82,7 @@
               <VideoPlayer
                 v-else
                 :stream="getScreenStream(user)"
-                :name="user.name + ' 的屏幕'"
+                :name="t('room.screenOf', { name: user.name })"
                 :micOpen="user.micOpen"
                 :sreenStream="true"
                 :muted="user.id === localUser.id"
@@ -141,11 +141,39 @@
         :users="users"
         :localUser="localUser"
         :chatMessages="chatMessages"
+        :interpretingUsers="interpretingUsers"
+        :receivingInterpretation="receivingInterpretation"
         v-model:activeTab="activeTab"
         @update:mobileShow="mobileShowSidebar = $event"
         @sendMessage="handleSendMessage"
         @requestControl="requestControl"
+        @toggleInterpretation="handleToggleInterpretation"
       />
+    </div>
+
+    <div
+      v-if="interpretationErrors.length > 0"
+      class="absolute top-4 left-1/2 -translate-x-1/2 z-40 max-w-[min(90vw,40rem)] bg-red-950/95 border border-red-500/40 px-4 py-3 rounded-md shadow-xl"
+    >
+      <p class="text-sm font-medium text-red-200">{{ t('interpretation.captureError') }}</p>
+      <p class="mt-1 text-xs text-red-300">{{ interpretationErrors[0] }}</p>
+    </div>
+
+    <div
+      v-if="interpretationCaptions.length > 0"
+      class="absolute bottom-20 left-1/2 -translate-x-1/2 z-30 w-[min(88vw,42rem)] max-h-36 overflow-hidden space-y-1.5 pointer-events-none"
+      aria-live="polite"
+    >
+      <div
+        v-for="caption in interpretationCaptions"
+        :key="caption.id"
+        class="bg-black/80 border border-white/15 px-4 py-2.5 rounded-md shadow-xl text-center"
+      >
+        <p class="text-[11px] text-amber-300 mb-1">{{ caption.label }}</p>
+        <p class="text-sm sm:text-base text-white leading-snug wrap-break-word line-clamp-2">
+          {{ caption.text }}
+        </p>
+      </div>
     </div>
 
     <!-- 底部功能栏 -->
@@ -178,6 +206,83 @@
         :muted="user.id === localUser.id"
       />
     </div>
+
+    <!-- 同传语言选择弹窗 -->
+    <div
+      v-if="showLangPicker"
+      class="fixed inset-0 bg-black/70 flex items-center justify-center z-50 backdrop-blur-sm"
+      @click.self="showLangPicker = false"
+    >
+      <div
+        class="bg-slate-900 border border-white/20 p-6 rounded-2xl w-full max-w-sm text-white shadow-2xl"
+      >
+        <h3 class="text-lg font-bold mb-4 flex items-center gap-2">
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            class="w-5 h-5 text-amber-400"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          >
+            <path d="m5 8 6 6" />
+            <path d="m4 14 6-6 2-3" />
+            <path d="M2 5h12" />
+            <path d="M7 2h1" />
+            <path d="m22 22-5-10-5 10" />
+            <path d="M14 18h6" />
+          </svg>
+          {{ t('interpretation.title') }}
+        </h3>
+        <p class="text-sm text-gray-400 mb-5">{{ t('interpretation.description') }}</p>
+
+        <div class="space-y-4">
+          <div>
+            <label class="block text-xs text-gray-400 mb-1.5 uppercase tracking-wider">{{
+              t('interpretation.myLanguage')
+            }}</label>
+            <select
+              v-model="myLanguage"
+              class="w-full bg-slate-800 border border-white/10 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-amber-500/50"
+            >
+              <option v-for="lang in supportedLanguages" :key="lang.code" :value="lang.code">
+                {{ t('languages.' + lang.code) }}
+              </option>
+            </select>
+          </div>
+          <div>
+            <label class="block text-xs text-gray-400 mb-1.5 uppercase tracking-wider">{{
+              t('interpretation.peerLanguage')
+            }}</label>
+            <select
+              v-model="peerLanguage"
+              class="w-full bg-slate-800 border border-white/10 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-amber-500/50"
+            >
+              <option v-for="lang in supportedLanguages" :key="lang.code" :value="lang.code">
+                {{ t('languages.' + lang.code) }}
+              </option>
+            </select>
+          </div>
+        </div>
+
+        <div class="mt-6 flex justify-end gap-3">
+          <button
+            @click="showLangPicker = false"
+            class="px-4 py-2 hover:bg-white/10 rounded-lg text-sm transition-colors cursor-pointer"
+          >
+            {{ t('settings.cancel') }}
+          </button>
+          <button
+            @click="confirmStartInterpretation"
+            class="px-4 py-2 bg-amber-600 hover:bg-amber-700 rounded-lg text-sm font-medium transition-colors shadow-lg shadow-amber-500/20 cursor-pointer"
+          >
+            {{ t('interpretation.start') }}
+          </button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -193,6 +298,10 @@ import RoomControls from '@/components/room/RoomControls.vue'
 import RoomSidebar from '@/components/room/RoomSidebar.vue'
 import { transcribeAudio, summarizeText, type LLMConfig } from '@/utils/llm'
 import { convertWebMToMp3 } from '@/utils/audioConverter'
+import { useInterpretation } from '@/composables/useInterpretation'
+import { useI18n } from 'vue-i18n'
+
+const { t } = useI18n()
 
 const route = useRoute()
 const router = useRouter()
@@ -206,6 +315,9 @@ const {
   localStream,
   localScreenStream,
   socket,
+  reservePeerAudioTrackOverride,
+  setPeerAudioTrackOverride,
+  clearPeerAudioTrackOverride,
   init,
   toggleMic,
   toggleCam,
@@ -218,6 +330,116 @@ const {
   sendControlEvent,
   stopControl,
 } = useWebRTC(roomId, userName)
+
+// ====== 同传 ======
+const {
+  state: interpretationState,
+  startInterpretation,
+  stopInterpretation,
+  isInterpretingFor,
+  setupSocketListeners: setupInterpretationListeners,
+  reapplyMutes: reapplyInterpretationMutes,
+  stopAll: stopAllInterpretation,
+} = useInterpretation(socket, localStream, users, {
+  reservePeerAudioTrackOverride,
+  setPeerAudioTrackOverride,
+  clearPeerAudioTrackOverride,
+})
+
+// 同传相关计算属性
+const interpretingUsers = computed(() => {
+  const set = new Set<string>()
+  for (const key of interpretationState.activeSessions.keys()) {
+    set.add(key)
+  }
+  return set
+})
+
+const receivingInterpretation = computed(() => {
+  return interpretationState.receivingFrom
+})
+
+const interpretationCaptions = computed(() => {
+  const captions: Array<{ id: string; label: string; text: string }> = []
+
+  for (const [userId, transcript] of interpretationState.receivedTranscripts) {
+    if (!transcript.outputText) continue
+    captions.push({
+      id: `received-${userId}`,
+      label: t('interpretation.captionFrom', {
+        name: users.get(userId)?.name || t('room.unknownUser'),
+      }),
+      text: transcript.outputText,
+    })
+  }
+
+  for (const [userId, session] of interpretationState.activeSessions) {
+    if (!session.outputTranscript) continue
+    captions.push({
+      id: `outgoing-${userId}`,
+      label: t('interpretation.captionTo', {
+        name: users.get(userId)?.name || t('room.unknownUser'),
+      }),
+      text: session.outputTranscript,
+    })
+  }
+
+  return captions.slice(-2)
+})
+
+const interpretationErrors = computed(() =>
+  [
+    interpretationState.errorMessage,
+    ...[...interpretationState.activeSessions.values()].flatMap((session) =>
+      [session.sessionError, session.captureState === 'error' ? session.captureError : ''].filter(
+        Boolean,
+      ),
+    ),
+  ].filter(Boolean),
+)
+
+// 同传语言选择弹窗状态
+const showLangPicker = ref(false)
+const langPickerTargetUser = ref('')
+const myLanguage = ref('zh-Hans')
+const peerLanguage = ref('en')
+
+const supportedLanguages = [
+  { code: 'en' },
+  { code: 'zh-Hans' },
+  { code: 'zh-Hant' },
+  { code: 'ja' },
+  { code: 'ko' },
+  { code: 'fr' },
+  { code: 'de' },
+  { code: 'es' },
+  { code: 'ru' },
+  { code: 'ar' },
+  { code: 'pt-BR' },
+  { code: 'it' },
+  { code: 'th' },
+  { code: 'vi' },
+]
+
+const handleToggleInterpretation = (userId: string) => {
+  if (isInterpretingFor(userId) || interpretationState.receivingFrom.has(userId)) {
+    // 关闭同传
+    stopInterpretation(userId)
+  } else {
+    // 弹出语言选择
+    langPickerTargetUser.value = userId
+    showLangPicker.value = true
+  }
+}
+
+const confirmStartInterpretation = async () => {
+  showLangPicker.value = false
+  try {
+    await startInterpretation(langPickerTargetUser.value, peerLanguage.value, myLanguage.value)
+  } catch (e: unknown) {
+    alert(t('interpretation.startFailed', { error: e instanceof Error ? e.message : String(e) }))
+  }
+}
 
 const showSidebar = ref(true) //桌面端右边栏
 const mobileShowSidebar = ref(false) //移动端右边栏（实际上变到了下边）
@@ -333,7 +555,7 @@ const handleScreenShare = () => {
 
 const leaveRoom = () => {
   if (isRecording.value) {
-    if (confirm('录制进行中，是否放弃？')) {
+    if (confirm(t('room.leaveConfirm'))) {
       stopRecording() // Clean stop
       router.push('/')
     }
@@ -594,15 +816,15 @@ const processRecording = async (blob: Blob) => {
     return
   }
 
-  if (confirm('录制完成。是否下载录像并使用 AI 进行会议归纳？')) {
+  if (confirm(t('recording.complete'))) {
     downloadVideo()
 
     try {
-      const confirmStart = confirm('即将将录音转换为 MP3 并上传进行归纳，点击确定开始。')
+      const confirmStart = confirm(t('recording.convertConfirm'))
       if (!confirmStart) return
 
       // Convert to MP3
-      alert('正在转换音频格式为 MP3...')
+      alert(t('recording.converting'))
       const mp3Blob = await convertWebMToMp3(blob)
 
       // Download MP3
@@ -628,10 +850,10 @@ const processRecording = async (blob: Blob) => {
       a2.download = `meeting-summary-${Date.now()}.md`
       a2.click()
 
-      alert('会议摘要已生成并下载！')
+      alert(t('recording.summaryDone'))
     } catch (e: unknown) {
       console.error(e)
-      alert('AI 处理失败: ' + (e instanceof Error ? e.message : String(e)))
+      alert(t('recording.aiFailed', { error: e instanceof Error ? e.message : String(e) }))
     }
   } else {
     downloadVideo()
@@ -903,7 +1125,7 @@ watch(
   (newSocket) => {
     if (newSocket) {
       newSocket.on('chat-message', (data: ChatMessageData) => {
-        let senderName = '未知用户'
+        let senderName = t('room.unknownUser')
         if (users.has(data.senderId)) {
           senderName = users.get(data.senderId)!.name
         }
@@ -920,13 +1142,26 @@ watch(
         chatMessages.value.push(msg)
         showQuickMessage(senderName, data.message)
       })
+
+      // 初始化同传 socket 监听
+      setupInterpretationListeners()
     }
   },
+)
+
+// 当远端用户流变化时（如对方开麦），重新应用同传静音
+watch(
+  users,
+  () => {
+    reapplyInterpretationMutes()
+  },
+  { deep: true },
 )
 
 onUnmounted(() => {
   toggleIntercept(false)
   stopKeepAlive()
+  stopAllInterpretation()
   window.removeEventListener('beforeunload', handleBeforeUnload)
   window.removeEventListener('keydown', handleRemoteKeyDown)
   window.removeEventListener('keyup', handleRemoteKeyUp)

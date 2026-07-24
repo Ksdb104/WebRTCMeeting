@@ -13,6 +13,7 @@ Tauri桌面端支持远程控制功能。
 - **房间管理**：自动生成 6 位房间码，支持加入现有房间
 
 ### 🛠️ 进阶功能
+- **AI 同声传译**：基于 Google Gemini 的实时语音翻译，支持双向同传 + 实时字幕（需要配置 Gemini API Key）
 - **远程协助**：请求控制对方桌面（需要 Tauri 桌面环境）
 - **会议录制**：录制会议内容，支持视频下载
 - **实时聊天**：文字聊天和快速消息提示
@@ -59,7 +60,8 @@ WebRTCMeeting/
 │   │   │   ├── VideoPlayer.vue  # 视频播放器组件
 │   │   │   └── room/            # 会议室相关组件
 │   │   ├── composables/         # 组合式函数
-│   │   │   └── useWebRTC.ts     # WebRTC 核心逻辑
+│   │   │   ├── useWebRTC.ts     # WebRTC 核心逻辑
+│   │   │   └── useInterpretation.ts # AI 同声传译逻辑
 │   │   ├── views/               # 页面视图
 │   │   │   ├── HomeView.vue     # 首页（创建/加入房间）
 │   │   │   └── RoomView.vue     # 会议室页面
@@ -68,6 +70,8 @@ WebRTCMeeting/
 │   │   │   ├── audioConverter.ts # 音频格式转换
 │   │   │   ├── globalAudio.ts   # 全局音频上下文
 │   │   │   └── llm.ts           # AI 功能集成
+│   │   ├── worklets/            # Audio Worklet
+│   │   │   └── interpretationCapture.worklet.ts # 同传音频采集
 │   │   └── router/              # 路由配置
 │   ├── src-tauri/               # Tauri 后端（Rust）
 │   │   ├── src/
@@ -154,6 +158,36 @@ pnpm tauri dev
 ### 3. 高级功能
 - **远程协助**：在成员列表中点击「请求控制」
 - **会议录制**：点击录制按钮开始/停止录制
+
+### 4. AI 同声传译
+同传功能基于 Google Gemini (`gemini-3.5-live-translate-preview`) 模型，实现会议中的实时语音翻译。
+
+#### 工作原理
+1. **音频采集**：通过 AudioWorklet 实时采集麦克风 PCM 音频数据
+2. **AI 翻译**：将音频流通过 WebSocket 发送到 Gemini 进行实时翻译
+3. **轨道替换**：翻译后的音频通过 WebRTC `replaceTrack` 替换原始音频轨道发送给对方
+4. **双向同传**：双方各自运行独立的翻译会话，实现真正的双向实时翻译
+5. **实时字幕**：同时输出转录文本，在画面底部显示实时字幕
+
+#### 配置方法
+1. 前往 [Google AI Studio](https://aistudio.google.com/apikey) 获取 API Key
+2. 在服务端环境变量文件 `.env.server` 中配置：
+   ```env
+   GEMINI_API_KEY=你的API密钥
+   ```
+3. 重启信令服务器使配置生效
+
+#### 使用方式
+1. 进入会议室后，在成员列表中点击对应成员的「同传」按钮
+2. 选择**我的语言**（你会听到的语言）和**对方语言**（对方会听到的语言）
+3. 确认后即可开始同声传译，双方各自听到翻译后的语音
+4. 任意一方可以随时关闭同传功能
+
+#### 注意事项
+- 需要稳定的网络连接以支持实时音频传输
+- 翻译质量取决于 Gemini API 的服务状态
+- 同传开启后会自动静音对方的原始声音，只播放翻译后的音频
+- 支持的翻译语言以 Gemini 模型实际支持为准
 
 ## ⚙️ 配置说明
 
@@ -247,6 +281,7 @@ pnpm tauri build
 | 音视频通话 | ✅ | ✅ | ✅ | ✅ | ✅ |
 | 屏幕共享 | ✅ | ✅ | ✅ | ⚠️ | ❌ |
 | 会议录制 | ✅ | ✅ | ✅ | ⚠️ | ❌ |
+| AI 同声传译 | ✅ | ✅ | ✅ | ⚠️ | ⚠️ |
 | 前后摄像头切换 | ✅ | ✅ | ✅ | ✅ | ✅ |
 | 音频混音 | ✅ | ✅ | ✅ | ✅ | ✅ |
 

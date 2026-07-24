@@ -8,12 +8,14 @@
     >
       <h2 class="text-xl font-bold mb-6 flex items-center gap-2">
         <Settings class="w-5 h-5 text-blue-400" />
-        会议归纳设置 (LLM)
+        {{ t('settings.title') }}
       </h2>
 
       <div class="space-y-4">
         <div>
-          <label class="block text-xs text-gray-400 mb-1 uppercase tracking-wider">预设配置</label>
+          <label class="block text-xs text-gray-400 mb-1 uppercase tracking-wider">{{
+            t('settings.presetConfig')
+          }}</label>
           <select
             v-model="localSelectedPresetIndex"
             @change="applyPreset"
@@ -22,7 +24,7 @@
             <option v-for="(preset, index) in defaultPresets" :key="index" :value="index">
               {{ preset.name }}
             </option>
-            <option :value="-1">自定义</option>
+            <option :value="-1">{{ t('settings.custom') }}</option>
           </select>
         </div>
 
@@ -51,13 +53,13 @@
 
         <div>
           <div class="pb-2">
-            <label class="block text-xs text-gray-400 mb-1 uppercase tracking-wider"
-              >STT API Key (可选)</label
-            >
+            <label class="block text-xs text-gray-400 mb-1 uppercase tracking-wider">{{
+              t('settings.sttApiKeyOptional')
+            }}</label>
             <input
               v-model="localConfig.sttApiKey"
               type="password"
-              placeholder="若空则用LLM Key"
+              :placeholder="t('settings.sttApiKeyPlaceholder')"
               class="w-full bg-slate-800 border border-white/10 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/50"
             />
           </div>
@@ -103,13 +105,13 @@
           @click="close"
           class="px-4 py-2 hover:bg-white/10 rounded-lg text-sm transition-colors cursor-pointer"
         >
-          取消
+          {{ t('settings.cancel') }}
         </button>
         <button
           @click="save"
           class="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg text-sm font-medium transition-colors shadow-lg shadow-blue-500/20 cursor-pointer"
         >
-          保存配置
+          {{ t('settings.save') }}
         </button>
       </div>
     </div>
@@ -120,6 +122,9 @@
 import { ref, watch, reactive } from 'vue'
 import { Settings } from 'lucide-vue-next'
 import { defaultPresets, type LLMConfig } from '@/utils/llm'
+import { useI18n } from 'vue-i18n'
+
+const { t } = useI18n()
 
 interface Props {
   modelValue: boolean
