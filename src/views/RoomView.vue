@@ -289,7 +289,6 @@ import VideoPlayer from '@/components/VideoPlayer.vue'
 import RoomControls from '@/components/room/RoomControls.vue'
 import RoomSidebar from '@/components/room/RoomSidebar.vue'
 import { transcribeAudio, summarizeText, type LLMConfig } from '@/utils/llm'
-import { convertWebMToMp3 } from '@/utils/audioConverter'
 import { useInterpretation } from '@/composables/useInterpretation'
 import { useI18n } from 'vue-i18n'
 
@@ -813,6 +812,7 @@ const processRecording = async (blob: Blob) => {
 
       // Convert to MP3
       alert(t('recording.converting'))
+      const { convertWebMToMp3 } = await import('@/utils/audioConverter')
       const mp3Blob = await convertWebMToMp3(blob)
 
       // Download MP3

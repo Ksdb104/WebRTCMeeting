@@ -169,7 +169,7 @@ import {
   Maximize,
   Minimize,
   Share,
-} from 'lucide-vue-next'
+} from '@lucide/vue'
 import type { User } from '@/composables/useWebRTC'
 import { useDeviceStore } from '@/stores/device'
 import { storeToRefs } from 'pinia'

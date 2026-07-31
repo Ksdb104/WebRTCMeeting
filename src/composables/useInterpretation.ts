@@ -11,6 +11,8 @@ export interface InterpretationSession {
   isConnected: boolean
   isConnecting: boolean
   sessionError: string
+  reconnectAttempts: number
+  reconnectTimer: ReturnType<typeof setTimeout> | null
   // 音频采集（发送到 Gemini）
   sourceNode: MediaStreamAudioSourceNode | null
   processorNode: AudioWorkletNode | null
@@ -49,11 +51,35 @@ const WS_ENDPOINT =
 const TRANSLATION_OUTPUT_GAIN = 1.0 //确定不是音量的问题,但去掉太麻烦了,先留着这个控制项
 const TRANSLATION_SAMPLE_RATE = 24000
 const TRANSLATION_AUDIO_BITRATE = 24000
-const TRANSLATION_BUFFER_SECONDS = 0.45
+const TRANSLATION_BUFFER_MAX_WAIT_SECONDS = 0.1
 const CAPTURE_WORKLET_NAME = 'interpretation-pcm-capture'
-const CAPTION_MAX_LENGTH = 32
-const CAPTION_HIDE_DELAY_MS = 4000
+const GEMINI_RECONNECT_DELAYS_MS = [500, 1000, 2000]
+const CAPTION_MAX_LENGTH = 40
+const CAPTION_HIDE_DELAY_MS = 5000
 const captureWorkletModuleLoads = new WeakMap<BaseAudioContext, Promise<void>>()
+
+const createGeminiSetupMessage = (targetLanguage: string) => ({
+  setup: {
+    model: 'models/gemini-3.5-live-translate-preview',
+    inputAudioTranscription: {},
+    outputAudioTranscription: {},
+    realtimeInputConfig: {
+      automaticActivityDetection: {
+        disabled: false,
+        prefixPaddingMs: 250,
+        silenceDurationMs: 800,
+      },
+      activityHandling: 'NO_INTERRUPTION',
+    },
+    generationConfig: {
+      responseModalities: ['AUDIO'],
+      translationConfig: {
+        targetLanguageCode: targetLanguage,
+        echoTargetLanguage: false,
+      },
+    },
+  },
+})
 
 const ensureCaptureWorkletModule = (audioContext: AudioContext) => {
   if (!audioContext.audioWorklet || typeof AudioWorkletNode === 'undefined') {
@@ -84,6 +110,7 @@ export function useInterpretation(
   const mutedByInterpretation = reactive<Set<string>>(new Set())
   const myVoiceMutedFor = reactive<Set<string>>(new Set())
   const audioReadyFrom = new Set<string>()
+  const outputPlaybackTimes = new WeakMap<InterpretationSession, number>()
   const outgoingCaptionTimeouts = new Map<string, ReturnType<typeof setTimeout>>()
   const receivedCaptionTimeouts = new Map<string, ReturnType<typeof setTimeout>>()
 
@@ -180,8 +207,108 @@ export function useInterpretation(
     })
   }
 
+  const isCurrentSession = (session: InterpretationSession) => {
+    const activeSession = state.activeSessions.get(session.targetUserId)
+    return Boolean(activeSession && toRaw(activeSession) === toRaw(session))
+  }
+
+  const scheduleGeminiReconnect = (session: InterpretationSession, reason: string) => {
+    if (!isCurrentSession(session) || session.reconnectTimer) return
+
+    const delay = GEMINI_RECONNECT_DELAYS_MS[session.reconnectAttempts]
+    if (delay === undefined) {
+      session.sessionError = `Gemini 同传连接已中断：${reason}`
+      state.errorMessage = session.sessionError
+      void stopInterpretation(session.targetUserId)
+      return
+    }
+
+    session.reconnectAttempts += 1
+    session.isConnected = false
+    session.isConnecting = true
+    session.sessionError = `Gemini 同传连接中断，正在重连（${session.reconnectAttempts}/${GEMINI_RECONNECT_DELAYS_MS.length}）`
+    state.errorMessage = session.sessionError
+
+    session.reconnectTimer = setTimeout(() => {
+      session.reconnectTimer = null
+      if (!isCurrentSession(session)) return
+      void connectGeminiSession(session).catch((error) => {
+        const message = error instanceof Error ? error.message : String(error)
+        scheduleGeminiReconnect(session, message)
+      })
+    }, delay)
+  }
+
+  const connectGeminiSession = async (session: InterpretationSession) => {
+    const token = await getEphemeralToken(session.targetLanguage)
+    if (!isCurrentSession(session)) return
+
+    const wsUrl = `${WS_ENDPOINT}?access_token=${encodeURIComponent(token)}`
+    const ws = new WebSocket(wsUrl)
+    session.ws = ws
+    session.isConnecting = true
+
+    ws.onopen = () => {
+      if (session.ws !== ws) return
+      ws.send(JSON.stringify(createGeminiSetupMessage(session.targetLanguage)))
+    }
+
+    ws.onmessage = (event) => {
+      if (session.ws === ws) handleGeminiMessage(session, event)
+    }
+
+    const handleDisconnect = (reason: string) => {
+      if (session.ws !== ws) return
+      session.ws = null
+      try {
+        ws.close()
+      } catch {
+        // The socket can already be closed by the remote endpoint.
+      }
+      scheduleGeminiReconnect(session, reason)
+    }
+
+    ws.onerror = () => {
+      console.error('[Interpretation] Gemini WS error')
+      handleDisconnect('WebSocket 网络错误')
+    }
+
+    ws.onclose = (event) => {
+      console.log(
+        `[Interpretation] Gemini WS closed: ${session.targetUserId}, code: ${event.code}, reason: ${event.reason}`,
+      )
+      handleDisconnect(`${event.code}${event.reason ? `: ${event.reason}` : ''}`)
+    }
+  }
+
   // ====== 创建翻译音频输出流 ======
-  // 创建一个持续输出的 MediaStream，翻译音频片段到达时通过 BufferSource 播放到 destination
+  const drainTranslationAudio = (session: InterpretationSession) => {
+    const rawSession = toRaw(session)
+    const ctx = session.outputAudioContext
+    const outputGain = session.outputGainNode
+    if (!ctx || ctx.state === 'closed' || !outputGain) return
+
+    let nextTime = outputPlaybackTimes.get(rawSession) ?? 0
+    if (nextTime <= ctx.currentTime) {
+      nextTime = ctx.currentTime + TRANSLATION_BUFFER_MAX_WAIT_SECONDS
+    }
+
+    while (session.outputBuffer.length > 0) {
+      const chunk = session.outputBuffer.shift()!
+      const buffer = ctx.createBuffer(1, chunk.length, TRANSLATION_SAMPLE_RATE)
+      buffer.getChannelData(0).set(chunk)
+
+      const source = ctx.createBufferSource()
+      source.buffer = buffer
+      source.connect(outputGain)
+      source.start(nextTime)
+      nextTime += buffer.duration
+    }
+
+    outputPlaybackTimes.set(rawSession, nextTime)
+  }
+
+  // 创建一个持续输出的 MediaStream，翻译音频到达时直接交给 Web Audio 时钟调度。
   const createOutputAudioStream = (session: InterpretationSession) => {
     // 复用麦克风采集使用的上下文。WebSocket 回调中新建 AudioContext 可能被自动播放策略挂起。
     const ctx = getSharedAudioContext()
@@ -195,56 +322,8 @@ export function useInterpretation(
     outputGain.connect(dest)
     session.outputGainNode = outputGain
 
-    // 短暂预缓冲可吸收 Gemini WebSocket 分片到达时间的波动。
-    let nextTime = 0
-    let isBuffering = true
-    let bufferingStartedAt = ctx.currentTime
-    const drainBuffer = () => {
-      if (!session.outputAudioContext || session.outputAudioContext.state === 'closed') return
-
-      const now = ctx.currentTime
-      if (nextTime <= now && !isBuffering) {
-        nextTime = 0
-        isBuffering = true
-        bufferingStartedAt = now
-      }
-
-      if (isBuffering) {
-        const queuedSeconds =
-          session.outputBuffer.reduce((samples, chunk) => samples + chunk.length, 0) /
-          TRANSLATION_SAMPLE_RATE
-        if (queuedSeconds === 0) {
-          bufferingStartedAt = now
-          requestAnimationFrame(drainBuffer)
-          return
-        }
-        if (
-          queuedSeconds < TRANSLATION_BUFFER_SECONDS &&
-          now - bufferingStartedAt < TRANSLATION_BUFFER_SECONDS
-        ) {
-          requestAnimationFrame(drainBuffer)
-          return
-        }
-        nextTime = now
-        isBuffering = false
-      }
-
-      while (session.outputBuffer.length > 0) {
-        const chunk = session.outputBuffer.shift()!
-        const buffer = ctx.createBuffer(1, chunk.length, TRANSLATION_SAMPLE_RATE)
-        buffer.getChannelData(0).set(chunk)
-
-        const source = ctx.createBufferSource()
-        source.buffer = buffer
-        source.connect(outputGain)
-
-        source.start(nextTime)
-        nextTime += buffer.duration
-      }
-
-      requestAnimationFrame(drainBuffer)
-    }
-    requestAnimationFrame(drainBuffer)
+    outputPlaybackTimes.set(toRaw(session), 0)
+    drainTranslationAudio(session)
 
     return dest.stream
   }
@@ -308,6 +387,8 @@ export function useInterpretation(
       isConnected: false,
       isConnecting: true,
       sessionError: '',
+      reconnectAttempts: 0,
+      reconnectTimer: null,
       sourceNode: null,
       processorNode: null,
       silentGainNode: null,
@@ -325,50 +406,7 @@ export function useInterpretation(
     state.activeSessions.set(targetUserId, session)
 
     try {
-      const token = await getEphemeralToken(peerLanguage)
-
-      const wsUrl = `${WS_ENDPOINT}?access_token=${encodeURIComponent(token)}`
-      const ws = new WebSocket(wsUrl)
-      session.ws = ws
-
-      ws.onopen = () => {
-        const setupMsg = {
-          setup: {
-            model: 'models/gemini-3.5-live-translate-preview',
-            inputAudioTranscription: {},
-            outputAudioTranscription: {},
-            generationConfig: {
-              responseModalities: ['AUDIO'],
-              translationConfig: {
-                targetLanguageCode: peerLanguage,
-                echoTargetLanguage: false,
-              },
-            },
-          },
-        }
-        ws.send(JSON.stringify(setupMsg))
-      }
-
-      ws.onmessage = (event) => handleGeminiMessage(session, event)
-
-      ws.onerror = (err) => {
-        console.error('[Interpretation] Gemini WS error:', err)
-        session.sessionError = 'Gemini 同传连接异常，请检查服务端网络后重试'
-        state.errorMessage = session.sessionError
-        stopInterpretation(targetUserId)
-      }
-
-      ws.onclose = (ev) => {
-        console.log(
-          `[Interpretation] Gemini WS closed: ${targetUserId}, code: ${ev.code}, reason: ${ev.reason}`,
-        )
-        session.isConnected = false
-        session.isConnecting = false
-        if (ev.code !== 1000 && ev.code !== 1005) {
-          session.sessionError = `Gemini 同传连接已关闭（${ev.code}${ev.reason ? `: ${ev.reason}` : ''}）`
-          state.errorMessage = session.sessionError
-        }
-      }
+      await connectGeminiSession(session)
 
       // 通知对方启动同传
       socket.value?.emit('interpretation-request', {
@@ -406,18 +444,23 @@ export function useInterpretation(
         console.log('[Interpretation] Gemini setup complete')
         session.isConnected = true
         session.isConnecting = false
+        session.reconnectAttempts = 0
+        session.sessionError = ''
+        state.errorMessage = ''
 
-        // 创建输出音频流并替换 WebRTC 轨道
-        const outputStream = createOutputAudioStream(session)
-        const outputTrack = outputStream.getAudioTracks()[0]
-        if (outputTrack) {
-          void replaceAudioTrackForPeer(session.targetUserId, outputTrack).then((replaced) => {
-            if (replaced) {
-              socket.value?.emit('interpretation-audio-ready', {
-                targetId: session.targetUserId,
-              })
-            }
-          })
+        // 首次连接时创建输出轨；重连只复用现有轨道，避免泄漏 Web Audio 节点。
+        if (!session.outputStream) {
+          const outputStream = createOutputAudioStream(session)
+          const outputTrack = outputStream.getAudioTracks()[0]
+          if (outputTrack) {
+            void replaceAudioTrackForPeer(session.targetUserId, outputTrack).then((replaced) => {
+              if (replaced) {
+                socket.value?.emit('interpretation-audio-ready', {
+                  targetId: session.targetUserId,
+                })
+              }
+            })
+          }
         }
 
         // 开始采集麦克风发给 Gemini
@@ -459,6 +502,7 @@ export function useInterpretation(
               const pcm = base64ToInt16Array(audioStr)
               const float32 = int16ToFloat32(pcm)
               session.outputBuffer.push(float32)
+              drainTranslationAudio(session)
             }
           }
         }
@@ -469,9 +513,27 @@ export function useInterpretation(
   }
 
   // ====== 麦克风采集 → Gemini ======
-  const disconnectAudioCapture = (session: InterpretationSession, signalStreamEnd = true) => {
+  const sendRealtimeAudio = (
+    session: InterpretationSession,
+    inputData: Float32Array,
+    sourceSampleRate: number,
+  ) => {
+    const resampledData = resample(inputData, sourceSampleRate, 16000)
+    const pcmData = float32ToInt16(resampledData)
+    const base64Audio = arrayBufferToBase64(pcmData.buffer)
+
+    session.ws!.send(
+      JSON.stringify({
+        realtimeInput: {
+          mediaChunks: [{ mimeType: 'audio/pcm;rate=16000', data: base64Audio }],
+        },
+      }),
+    )
+  }
+
+  const disconnectAudioCapture = (session: InterpretationSession, signalAudioStreamEnd = true) => {
     if (
-      signalStreamEnd &&
+      signalAudioStreamEnd &&
       session.inputAudioTrack &&
       session.ws?.readyState === WebSocket.OPEN &&
       session.isConnected
@@ -548,7 +610,6 @@ export function useInterpretation(
       console.error('[Interpretation] Audio capture worklet processor error')
     }
 
-    const targetSampleRate = 16000
     const sourceSampleRate = audioContext.sampleRate
 
     processorNode.port.onmessage = (event: MessageEvent<Float32Array>) => {
@@ -557,24 +618,7 @@ export function useInterpretation(
       const inputData = event.data
       if (!(inputData instanceof Float32Array) || inputData.length === 0) return
 
-      // 静音检测
-      let sumSquares = 0
-      for (let i = 0; i < inputData.length; i++) {
-        sumSquares += inputData[i]! * inputData[i]!
-      }
-      if (Math.sqrt(sumSquares / inputData.length) < 0.001) return
-
-      const resampledData = resample(inputData, sourceSampleRate, targetSampleRate)
-      const pcmData = float32ToInt16(resampledData)
-      const base64Audio = arrayBufferToBase64(pcmData.buffer)
-
-      session.ws.send(
-        JSON.stringify({
-          realtimeInput: {
-            mediaChunks: [{ mimeType: 'audio/pcm;rate=16000', data: base64Audio }],
-          },
-        }),
-      )
+      sendRealtimeAudio(session, inputData, sourceSampleRate)
     }
 
     const silentGain = audioContext.createGain()
@@ -594,6 +638,8 @@ export function useInterpretation(
     clearInterpretationStateForUser(targetUserId)
 
     if (session) {
+      if (session.reconnectTimer) clearTimeout(session.reconnectTimer)
+      session.reconnectTimer = null
       await audioTrackController.clearPeerAudioTrackOverride(targetUserId)
 
       // 清理采集
@@ -604,6 +650,7 @@ export function useInterpretation(
       session.outputStream?.getTracks().forEach((track) => track.stop())
       session.outputAudioContext = null
       session.outputBuffer = []
+      outputPlaybackTimes.delete(toRaw(session))
 
       // 关闭 Gemini WS
       if (session.ws) session.ws.close()
@@ -638,6 +685,8 @@ export function useInterpretation(
               isConnected: false,
               isConnecting: true,
               sessionError: '',
+              reconnectAttempts: 0,
+              reconnectTimer: null,
               sourceNode: null,
               processorNode: null,
               silentGainNode: null,
@@ -654,44 +703,7 @@ export function useInterpretation(
             state.activeSessions.set(requesterId, session)
             audioTrackController.reservePeerAudioTrackOverride(requesterId)
 
-            const token = await getEphemeralToken(targetLanguage)
-            const wsUrl = `${WS_ENDPOINT}?access_token=${encodeURIComponent(token)}`
-            const ws = new WebSocket(wsUrl)
-            session.ws = ws
-
-            ws.onopen = () => {
-              ws.send(
-                JSON.stringify({
-                  setup: {
-                    model: 'models/gemini-3.5-live-translate-preview',
-                    inputAudioTranscription: {},
-                    outputAudioTranscription: {},
-                    generationConfig: {
-                      responseModalities: ['AUDIO'],
-                      translationConfig: {
-                        targetLanguageCode: targetLanguage,
-                        echoTargetLanguage: false,
-                      },
-                    },
-                  },
-                }),
-              )
-            }
-
-            ws.onmessage = (event) => handleGeminiMessage(session, event)
-            ws.onerror = () => {
-              session.sessionError = 'Gemini 同传连接异常，请检查服务端网络后重试'
-              state.errorMessage = session.sessionError
-              stopInterpretation(requesterId)
-            }
-            ws.onclose = (event) => {
-              session.isConnected = false
-              session.isConnecting = false
-              if (event.code !== 1000 && event.code !== 1005) {
-                session.sessionError = `Gemini 同传连接已关闭（${event.code}${event.reason ? `: ${event.reason}` : ''}）`
-                state.errorMessage = session.sessionError
-              }
-            }
+            await connectGeminiSession(session)
 
             myVoiceMutedFor.add(requesterId)
           } catch (e) {
@@ -743,11 +755,15 @@ export function useInterpretation(
 
       if (state.activeSessions.has(senderId)) {
         const session = state.activeSessions.get(senderId)!
+        if (session.reconnectTimer) clearTimeout(session.reconnectTimer)
+        session.reconnectTimer = null
         await audioTrackController.clearPeerAudioTrackOverride(senderId)
         disconnectAudioCapture(session)
         if (session.outputGainNode) session.outputGainNode.disconnect()
         session.outputStream?.getTracks().forEach((track) => track.stop())
         session.outputAudioContext = null
+        session.outputBuffer = []
+        outputPlaybackTimes.delete(toRaw(session))
         if (session.ws) session.ws.close()
         state.activeSessions.delete(senderId)
       }

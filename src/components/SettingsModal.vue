@@ -120,7 +120,7 @@
 
 <script setup lang="ts">
 import { ref, watch, reactive } from 'vue'
-import { Settings } from 'lucide-vue-next'
+import { Settings } from '@lucide/vue'
 import { defaultPresets, type LLMConfig } from '@/utils/llm'
 import { useI18n } from 'vue-i18n'
 

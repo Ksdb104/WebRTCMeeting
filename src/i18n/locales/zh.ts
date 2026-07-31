@@ -35,6 +35,7 @@ export default {
     connected: '已连接',
     connecting: '连接中',
     messagePlaceholder: '输入消息...',
+    remoteAssist: '远程协助',
   },
   interpretation: {
     title: '同传设置',

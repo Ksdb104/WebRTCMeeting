@@ -56,7 +56,7 @@
     </button>
 
     <!-- Settings Modal -->
-    <SettingsModal v-model="showSettings" />
+    <SettingsModal v-if="showSettings" v-model="showSettings" />
 
     <!-- Main Content Card -->
     <div class="w-full max-w-md relative z-10">
@@ -173,12 +173,13 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, computed } from 'vue'
+import { ref, onMounted, onUnmounted, computed, defineAsyncComponent } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
-import { PlusCircle, LogIn, Hash, User as UserIcon, Settings, Video } from 'lucide-vue-next'
+import { PlusCircle, LogIn, Hash, User as UserIcon, Settings, Video } from '@lucide/vue'
 import { io, type Socket } from 'socket.io-client'
 import { useI18n } from 'vue-i18n'
-import SettingsModal from '@/components/SettingsModal.vue'
+
+const SettingsModal = defineAsyncComponent(() => import('@/components/SettingsModal.vue'))
 const wsURL = import.meta.env.VITE_WS_URL
 
 const { t, locale } = useI18n()

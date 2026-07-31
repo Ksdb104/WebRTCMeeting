@@ -54,7 +54,7 @@
 
 <script setup lang="ts">
 import { ref, watch, onMounted, onUnmounted, computed } from 'vue'
-import { MicOff, Mic } from 'lucide-vue-next'
+import { MicOff, Mic } from '@lucide/vue'
 import { getSharedAudioContext } from '@/utils/globalAudio'
 import { useDeviceStore } from '@/stores/device'
 import { storeToRefs } from 'pinia'

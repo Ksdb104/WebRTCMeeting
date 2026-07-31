@@ -227,7 +227,7 @@
 
 <script setup lang="ts">
 import { ref, nextTick, watch } from 'vue'
-import { Mic, MicOff, Video, VideoOff, Send, Languages } from 'lucide-vue-next'
+import { Mic, MicOff, Video, VideoOff, Send, Languages } from '@lucide/vue'
 import type { User } from '@/composables/useWebRTC'
 import { useI18n } from 'vue-i18n'
 

@@ -35,6 +35,7 @@ export default {
     connected: 'Connected',
     connecting: 'Connecting',
     messagePlaceholder: 'Type a message...',
+    remoteAssist: 'Remote Assist',
   },
   interpretation: {
     title: 'Interpretation Settings',
