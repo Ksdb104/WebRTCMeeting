@@ -1,5 +1,21 @@
 <template>
   <div class="h-dvh bg-slate-950 text-white flex flex-col overflow-hidden relative">
+    <!-- 信令断线提示 -->
+    <Transition name="fade">
+      <div
+        v-if="isReconnecting"
+        class="absolute top-4 left-1/2 -translate-x-1/2 z-50 flex items-center gap-2 px-4 py-2 rounded-full bg-amber-500/15 border border-amber-500/40 text-amber-200 text-sm shadow-lg backdrop-blur-sm"
+        role="status"
+        aria-live="polite"
+      >
+        <span
+          class="w-3.5 h-3.5 rounded-full border-2 border-amber-300/40 border-t-amber-200 animate-spin"
+          aria-hidden="true"
+        ></span>
+        {{ t('room.signalingLost') }}
+      </div>
+    </Transition>
+
     <!-- 左侧：快捷消息/文件 (透明背景，悬浮) -->
     <div
       class="absolute left-4 top-1/2 -translate-y-1/2 z-20 w-80 pointer-events-none space-y-2"
@@ -151,6 +167,31 @@
       <p class="mt-1 text-xs text-red-300">{{ interpretationErrors[0] }}</p>
     </div>
 
+    <!-- 同传降级提示 -->
+    <div
+      v-if="interpretationState.degradeNotices.length > 0"
+      class="absolute top-16 left-1/2 -translate-x-1/2 z-40 w-[min(90vw,32rem)] space-y-2"
+      role="status"
+      aria-live="polite"
+    >
+      <div
+        v-for="notice in interpretationState.degradeNotices"
+        :key="notice.id"
+        class="flex items-start gap-3 bg-amber-950/95 border border-amber-500/40 px-4 py-3 rounded-md shadow-xl"
+      >
+        <p class="flex-1 text-xs text-amber-200 leading-relaxed">
+          {{ degradeNoticeText(notice) }}
+        </p>
+        <button
+          class="text-amber-300/70 hover:text-amber-100 transition-colors text-xs shrink-0"
+          :aria-label="t('interpretation.degraded.dismiss')"
+          @click="dismissInterpretationNotice(notice.id)"
+        >
+          ✕
+        </button>
+      </div>
+    </div>
+
     <div
       v-if="interpretationCaptions.length > 0"
       class="absolute bottom-20 left-1/2 -translate-x-1/2 z-30 w-[min(88vw,42rem)] max-h-36 overflow-hidden space-y-1.5 pointer-events-none"
@@ -289,7 +330,10 @@ import VideoPlayer from '@/components/VideoPlayer.vue'
 import RoomControls from '@/components/room/RoomControls.vue'
 import RoomSidebar from '@/components/room/RoomSidebar.vue'
 import { transcribeAudio, summarizeText, type LLMConfig } from '@/utils/llm'
-import { useInterpretation } from '@/composables/useInterpretation'
+import {
+  useInterpretation,
+  type InterpretationDegradeNotice,
+} from '@/composables/useInterpretation'
 import { useI18n } from 'vue-i18n'
 
 const { t } = useI18n()
@@ -306,6 +350,11 @@ const {
   localStream,
   localScreenStream,
   socket,
+  isReconnecting,
+  onPeerSessionChanged,
+  onPeerRemoved,
+  onSignalingLost,
+  onSignalingRestored,
   reservePeerAudioTrackOverride,
   setPeerAudioTrackOverride,
   clearPeerAudioTrackOverride,
@@ -326,11 +375,17 @@ const {
   isInterpretingFor,
   setupSocketListeners: setupInterpretationListeners,
   reapplyMutes: reapplyInterpretationMutes,
+  dismissDegradeNotice: dismissInterpretationNotice,
   stopAll: stopAllInterpretation,
 } = useInterpretation(socket, localStream, users, {
   reservePeerAudioTrackOverride,
   setPeerAudioTrackOverride,
   clearPeerAudioTrackOverride,
+  // 同传的降级与重连由这几个连接生命周期回调驱动
+  onPeerSessionChanged,
+  onPeerRemoved,
+  onSignalingLost,
+  onSignalingRestored,
 })
 
 // 同传相关计算属性
@@ -373,6 +428,11 @@ const interpretationCaptions = computed(() => {
 
   return captions.slice(-2)
 })
+
+const degradeNoticeText = (notice: InterpretationDegradeNotice) =>
+  t(`interpretation.degraded.${notice.reason}`, {
+    name: notice.peerName || users.get(notice.peerId)?.name || t('room.unknownUser'),
+  })
 
 const interpretationErrors = computed(() =>
   [

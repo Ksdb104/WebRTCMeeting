@@ -121,6 +121,13 @@
                 <div class="w-1.5 h-1.5 rounded-full bg-green-400"></div>
                 {{ t('sidebar.speaking') }}
               </span>
+              <span
+                v-else-if="user.reconnecting"
+                class="text-xs text-orange-400 flex items-center gap-1"
+              >
+                <div class="w-1.5 h-1.5 rounded-full bg-orange-400 animate-pulse"></div>
+                {{ t('sidebar.reconnecting') }}
+              </span>
               <span v-else class="text-xs text-gray-500 flex items-center gap-1">
                 <div
                   :class="[

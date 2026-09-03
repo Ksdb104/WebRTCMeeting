@@ -25,6 +25,7 @@ export default {
     screenOf: '{name} 的屏幕',
     leaveConfirm: '录制进行中，是否放弃？',
     unknownUser: '未知用户',
+    signalingLost: '与服务器的连接已断开，正在重连…',
   },
   sidebar: {
     members: '成员',
@@ -34,6 +35,7 @@ export default {
     online: '在线',
     connected: '已连接',
     connecting: '连接中',
+    reconnecting: '重连中…',
     messagePlaceholder: '输入消息...',
     remoteAssist: '远程协助',
   },
@@ -51,6 +53,14 @@ export default {
     captureError: '同传音频采集失败',
     captionFrom: '来自 {name} 的同传',
     captionTo: '发给 {name} 的译文',
+    degraded: {
+      dismiss: '关闭提示',
+      'peer-reloaded': '{name} 刷新了页面，与其的同传已关闭，需要时请重新开启。',
+      'peer-left': '{name} 已离开房间，与其的同传已关闭。',
+      'peer-stopped': '{name} 已不再进行同传，与其的同传已关闭。',
+      'audio-timeout': '等不到 {name} 的翻译语音，已恢复其原声播放。',
+      'gemini-failed': '与 {name} 的同传因连接多次失败已关闭，请稍后重试。',
+    },
   },
   settings: {
     title: '会议归纳设置 (LLM)',

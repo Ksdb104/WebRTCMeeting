@@ -12,12 +12,68 @@ export interface User {
   camOpen: boolean
   isScreenSharing: boolean
   connected: boolean // WebRTC 连接状态
+  reconnecting?: boolean // 信令掉线、处于服务端重连宽限期内
+  sessionId?: string // 对端每次页面加载都会变，用于立刻识别失效的 PeerConnection
+  isDesktop?: boolean
   stream?: MediaStream // 摄像头流
   screenStream?: MediaStream // 屏幕共享流
   audioLevel?: number
   isSpeaking?: boolean
   camStreamId?: string
   screenStreamId?: string
+}
+
+// ====== 断线重连相关常量 ======
+// 双方同时判定需要重建时，忽略针对刚建立连接的重置请求，避免来回互相重置
+const PEER_RESET_DEBOUNCE_MS = 3000
+// ICE 重启的最大尝试次数，超过后彻底重建 PeerConnection
+const MAX_ICE_RESTARTS = 2
+// connectionState 进入 disconnected 后等待自愈的时间
+const DISCONNECTED_RECOVERY_DELAY_MS = 2500
+// 一次恢复动作之后再次检查的间隔
+const RECOVERY_RETRY_DELAY_MS = 5000
+// 新建连接后若迟迟连不上（例如 offer 正好在信令断开时丢失），到时兜底重试。
+// 留够 TURN 中继握手的时间，避免在正常建连过程中误触发 ICE 重启
+const PEER_CONNECT_TIMEOUT_MS = 10000
+
+const USER_ID_STORAGE_PREFIX = 'webrtc-meeting:user-id:'
+
+const createRandomId = () => {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID()
+  }
+  return `u-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+}
+
+/**
+ * 生成（或复用）与房间绑定的稳定用户 ID。
+ *
+ * socket.id 每次重连都会变化，用它当用户身份会导致：
+ * 服务端把重连的人当成新用户、对端收到的是一个陌生 ID，
+ * 于是旧的 PeerConnection 永远无法被正确重建，状态也全部丢失。
+ * 这里用 sessionStorage 持久化一个稳定 ID（页面刷新也能沿用），
+ * 让服务端在宽限期内把它识别为「同一个人重连」。
+ */
+const resolveStableUserId = (roomId: string) => {
+  const key = `${USER_ID_STORAGE_PREFIX}${roomId}`
+  try {
+    const saved = sessionStorage.getItem(key)
+    if (saved) return saved
+    const created = createRandomId()
+    sessionStorage.setItem(key, created)
+    return created
+  } catch {
+    // sessionStorage 不可用时退化为内存 ID（仅失去刷新后的重连能力）
+    return createRandomId()
+  }
+}
+
+const clearStableUserId = (roomId: string) => {
+  try {
+    sessionStorage.removeItem(`${USER_ID_STORAGE_PREFIX}${roomId}`)
+  } catch {
+    // 忽略
+  }
 }
 
 const ICE_SERVERS: RTCConfiguration = {
@@ -27,6 +83,9 @@ const ICE_SERVERS: RTCConfiguration = {
   ],
   bundlePolicy: 'max-bundle',
   // rtcpMuxPolicy: 'require',
+  // 建 PeerConnection 时就预热一条传输通道的候选，
+  // 等到真正 setLocalDescription 时候选已就绪，可省掉几百毫秒的收集时间
+  iceCandidatePoolSize: 2,
 }
 
 export function useWebRTC(roomId: string, userName: string) {
@@ -34,8 +93,75 @@ export function useWebRTC(roomId: string, userName: string) {
   // 保持 WebRTC 传输用的 Stream ID 不变，避免 renegotiation 时被识别为新流
   const originLocalStream = new MediaStream()
 
+  // 信令通道是否连通（用于 UI 显示「正在重连」）
+  const signalingConnected = ref(false)
+  const isReconnecting = ref(false)
+  // 是否已经成功加入过房间，用于区分首次连接与重连
+  const hasJoinedRoom = ref(false)
+
+  /**
+   * 本次页面加载的会话 ID —— 刻意不做持久化。
+   * userId 跨刷新保持不变（用于身份识别），sessionId 每次加载都变（用于识别 JS 上下文已重建）。
+   * 对端看到 sessionId 变化，就能立刻断定手里的 PeerConnection 已经是死的，
+   * 不必等 ICE 超时（10~30 秒）才发现，这是刷新后重连慢的主要来源。
+   */
+  const localSessionId = createRandomId()
+
+  /**
+   * ====== 连接生命周期回调 ======
+   *
+   * 同传等上层模块需要知道「对端页面重载 / 对端离开房间 / 信令恢复」才能做降级与重连。
+   * 这些判定（尤其是 sessionChanged）已经在本模块算过一次，
+   * 不该让上层再监听一遍 socket 事件重复推导，所以在这里以订阅的形式暴露出去。
+   */
+  type PeerLifecycleListener = (peerId: string) => void
+  type SignalingRestoredListener = (payload: { isReconnect: boolean }) => void
+
+  const peerSessionChangedListeners = new Set<PeerLifecycleListener>()
+  const peerRemovedListeners = new Set<PeerLifecycleListener>()
+  const signalingLostListeners = new Set<() => void>()
+  const signalingRestoredListeners = new Set<SignalingRestoredListener>()
+
+  // 单个监听器抛错不能影响其他监听器，也不能打断信令处理流程
+  const notifyListeners = <A extends unknown[]>(
+    listeners: Set<(...args: A) => void>,
+    ...args: A
+  ) => {
+    listeners.forEach((listener) => {
+      try {
+        listener(...args)
+      } catch (e) {
+        console.error('[WebRTC] 生命周期回调执行失败:', e)
+      }
+    })
+  }
+
+  /** 对端页面重新加载过（sessionId 变化），其上一个 JS 上下文里的一切都已失效 */
+  const onPeerSessionChanged = (listener: PeerLifecycleListener) => {
+    peerSessionChangedListeners.add(listener)
+    return () => peerSessionChangedListeners.delete(listener)
+  }
+
+  /** 对端已被移出房间（主动离开，或掉线超过服务端宽限期） */
+  const onPeerRemoved = (listener: PeerLifecycleListener) => {
+    peerRemovedListeners.add(listener)
+    return () => peerRemovedListeners.delete(listener)
+  }
+
+  /** 信令通道断开 */
+  const onSignalingLost = (listener: () => void) => {
+    signalingLostListeners.add(listener)
+    return () => signalingLostListeners.delete(listener)
+  }
+
+  /** 信令通道可用，且 join-room 已经发出（此时再 emit 才不会被服务端当成陌生连接丢弃） */
+  const onSignalingRestored = (listener: SignalingRestoredListener) => {
+    signalingRestoredListeners.add(listener)
+    return () => signalingRestoredListeners.delete(listener)
+  }
+
   const localUser = reactive<User>({
-    id: '',
+    id: resolveStableUserId(roomId),
     name: userName,
     joinTime: Date.now(),
     micOpen: false,
@@ -64,10 +190,34 @@ export function useWebRTC(roomId: string, userName: string) {
 
   // PeerConnections Map<userId, RTCPeerConnection>
   const peers = new Map<string, RTCPeerConnection>()
+
+  /**
+   * 每个对端的协商状态（Perfect Negotiation 所需）。
+   * polite 由双方 ID 大小确定，保证同一对用户中一方 polite、一方 impolite，
+   * 出现 offer 冲突（glare）时 polite 一侧回滚让路，避免连接卡死。
+   */
+  interface PeerNegotiationState {
+    pc: RTCPeerConnection
+    polite: boolean
+    makingOffer: boolean
+    ignoreOffer: boolean
+    isSettingRemoteAnswerPending: boolean
+    createdAt: number
+    recoveryAttempts: number
+    recoveryTimer: ReturnType<typeof setTimeout> | null
+  }
+  const peerNegotiations = new Map<string, PeerNegotiationState>()
+  // remoteDescription 未就绪时暂存的 ICE 候选
+  const pendingCandidates = new Map<string, RTCIceCandidateInit[]>()
+
+  const peerMicrophoneSenders = new Map<string, RTCRtpSender>()
   interface PeerAudioTrackOverride {
     track: MediaStreamTrack | null
     sender: RTCRtpSender | null
     originalMaxBitrates: Array<number | undefined> | null
+    // 期望的码率上限（同传译音轨用）。存在这里是为了 PeerConnection 重建后能重新施加，
+    // 否则重建会退回默认码率
+    preferredMaxBitrate: number | null
   }
   const peerAudioTrackOverrides = new Map<string, PeerAudioTrackOverride>()
   const peerAudioTrackOperations = new Map<string, Promise<unknown>>()
@@ -104,20 +254,49 @@ export function useWebRTC(roomId: string, userName: string) {
     return null
   }
 
+  const getPeerMicrophoneSender = (targetId: string, pc: RTCPeerConnection) => {
+    const sender = peerMicrophoneSenders.get(targetId)
+    if (sender && pc.getSenders().includes(sender)) return sender
+
+    peerMicrophoneSenders.delete(targetId)
+    return null
+  }
+
   const reservePeerAudioTrackOverride = (targetId: string) => {
     if (!peerAudioTrackOverrides.has(targetId)) {
       peerAudioTrackOverrides.set(targetId, {
         track: null,
         sender: null,
         originalMaxBitrates: null,
+        preferredMaxBitrate: null,
       })
     }
   }
 
-  const setPeerAudioTrackOverride = async (targetId: string, track: MediaStreamTrack) => {
+  // 施加 override 期望的码率上限（重建 PeerConnection 后也要能重新施加）
+  const applyOverrideBitrate = async (sender: RTCRtpSender, maxBitrate: number | null) => {
+    if (!maxBitrate) return
+    try {
+      const parameters = sender.getParameters()
+      if (!parameters.encodings?.length) return
+      parameters.encodings.forEach((encoding) => {
+        encoding.maxBitrate = maxBitrate
+      })
+      await sender.setParameters(parameters)
+    } catch (e) {
+      console.warn('[WebRTC] 设置替换音轨码率失败:', e)
+    }
+  }
+
+  const setPeerAudioTrackOverride = async (
+    targetId: string,
+    track: MediaStreamTrack,
+    options?: { maxBitrate?: number },
+  ) => {
     reservePeerAudioTrackOverride(targetId)
     const override = peerAudioTrackOverrides.get(targetId)!
     override.track = track
+    if (options?.maxBitrate !== undefined) override.preferredMaxBitrate = options.maxBitrate
 
     return enqueuePeerAudioTrackOperation(targetId, async () => {
       const pc = peers.get(targetId)
@@ -126,6 +305,7 @@ export function useWebRTC(roomId: string, userName: string) {
       const defaultAudio = getDefaultOutgoingAudio()
       let sender = override.sender
       if (sender && !pc.getSenders().includes(sender)) sender = null
+      if (!sender) sender = getPeerMicrophoneSender(targetId, pc)
       if (!sender && defaultAudio) {
         sender = pc.getSenders().find((candidate) => candidate.track === defaultAudio.track) ?? null
       }
@@ -145,6 +325,8 @@ export function useWebRTC(roomId: string, userName: string) {
       }
 
       override.sender = sender
+      peerMicrophoneSenders.set(targetId, sender)
+      await applyOverrideBitrate(sender, override.preferredMaxBitrate)
       return sender
     })
   }
@@ -159,16 +341,19 @@ export function useWebRTC(roomId: string, userName: string) {
       if (!pc) return
 
       const defaultAudio = getDefaultOutgoingAudio()
-      const sender = override.sender
+      let sender = override.sender
+      if (sender && !pc.getSenders().includes(sender)) sender = null
+      if (!sender) sender = getPeerMicrophoneSender(targetId, pc)
       const existingDefaultSender = defaultAudio
         ? pc.getSenders().find((candidate) => candidate.track === defaultAudio.track)
         : undefined
 
-      if (sender && pc.getSenders().includes(sender)) {
+      if (sender) {
         if (existingDefaultSender && existingDefaultSender !== sender) {
           pc.removeTrack(sender)
-        } else if (defaultAudio) {
-          await sender.replaceTrack(defaultAudio.track)
+          peerMicrophoneSenders.set(targetId, existingDefaultSender)
+        } else {
+          await sender.replaceTrack(defaultAudio?.track ?? null)
           const parameters = sender.getParameters()
           if (parameters.encodings?.length && override.originalMaxBitrates) {
             parameters.encodings.forEach((encoding, index) => {
@@ -178,16 +363,31 @@ export function useWebRTC(roomId: string, userName: string) {
             })
             await sender.setParameters(parameters)
           }
-        } else {
-          pc.removeTrack(sender)
+          peerMicrophoneSenders.set(targetId, sender)
         }
       } else if (defaultAudio && !existingDefaultSender) {
-        pc.addTrack(defaultAudio.track, defaultAudio.stream)
+        const newSender = pc.addTrack(defaultAudio.track, defaultAudio.stream)
+        peerMicrophoneSenders.set(targetId, newSender)
       }
     })
   }
 
   const isPeerAudioTrackOverridden = (targetId: string) => peerAudioTrackOverrides.has(targetId)
+
+  /**
+   * 重连时必须把本地完整状态重新上报一次。
+   * 服务端在宽限期外会按默认值重建成员记录，
+   * 只补发 camStreamId（原实现）会让对端看到「麦克风/摄像头全关」的错误状态。
+   */
+  const buildLocalStatus = () => ({
+    micOpen: localUser.micOpen,
+    camOpen: localUser.camOpen,
+    isScreenSharing: localUser.isScreenSharing,
+    camStreamId: localUser.camStreamId,
+    screenStreamId: localUser.screenStreamId,
+    isSpeaking: false,
+    audioLevel: 0,
+  })
 
   // 初始化
   const init = async () => {
@@ -196,45 +396,124 @@ export function useWebRTC(roomId: string, userName: string) {
     socket.value = io(wsURL, {
       path: '/socket.io',
       transports: ['websocket', 'polling'],
+      reconnection: true,
+      reconnectionAttempts: Infinity,
+      reconnectionDelay: 400,
+      reconnectionDelayMax: 3000,
+      randomizationFactor: 0.3,
+      timeout: 8000,
     })
 
     socket.value.on('connect', () => {
-      console.log('Socket connected, joining room...')
-      localUser.id = socket.value!.id!
-      socket.value!.emit('join-room', { roomId, userName })
-      // 同步初始 ID 信息
-      socket.value!.emit('update-status', {
+      signalingConnected.value = true
+      isReconnecting.value = false
+      console.log(`[WebRTC] 信令已连接，${hasJoinedRoom.value ? '重新加入' : '加入'}房间 ${roomId}`)
+
+      // 用稳定 userId 加入，并带上当前真实状态，服务端据此识别重连并同步给其他人
+      socket.value!.emit('join-room', {
         roomId,
-        status: { camStreamId: localUser.camStreamId },
+        userName,
+        userId: localUser.id,
+        sessionId: localSessionId,
+        status: buildLocalStatus(),
       })
+
+      const isReconnect = hasJoinedRoom.value
+      hasJoinedRoom.value = true
+
+      // 必须在 join-room 之后再通知：socket.io 会在 connect 回调之前 flush 掉线期间
+      // 缓冲的 emit（socket.js onconnect 里 emitBuffered 早于 emitReserved('connect')），
+      // 那些包到达服务端时 socket.data.roomId 还没设上，会被静默丢弃。
+      // 所以上层要补发的消息必须挂在这个回调里。
+      notifyListeners(signalingRestoredListeners, { isReconnect })
+    })
+
+    socket.value.on('disconnect', (reason) => {
+      signalingConnected.value = false
+      // 主动断开（离开房间）不算重连
+      isReconnecting.value = reason !== 'io client disconnect'
+      console.warn('[WebRTC] 信令断开:', reason)
+      // 恢复计划不清空：recoverPeer 会在信令不通时自动顺延，
+      // 信令一恢复就能继续重连，避免连接永远停在 connecting
+      notifyListeners(signalingLostListeners)
+    })
+
+    socket.value.on('connect_error', (err) => {
+      signalingConnected.value = false
+      isReconnecting.value = true
+      console.warn('[WebRTC] 信令连接失败:', err.message)
     })
 
     // 3. 处理信令
+    // room-users 既是首次加入的初始化，也是每次重连后的全量对账
     socket.value.on('room-users', (userList: User[]) => {
-      // 初始化已存在的用戶
+      const remoteIds = new Set<string>()
+      const staleSessions = new Set<string>()
+
       userList.forEach((u) => {
-        if (u.id !== localUser.id) {
-          addUser(u)
-        }
+        if (u.id === localUser.id) return
+        remoteIds.add(u.id)
+        if (upsertUser(u).sessionChanged) staleSessions.add(u.id)
       })
+
+      // 清理已经不在房间里的用户（重连期间离开的人）
+      Array.from(users.keys()).forEach((id) => {
+        if (!remoteIds.has(id)) removeUser(id)
+      })
+
+      // 先让上层释放跟旧会话绑定的资源，再重建连接，
+      // 这样 createPeerConnection 才不会把对端已失效的替换轨重新挂上去
+      staleSessions.forEach((id) => notifyListeners(peerSessionChangedListeners, id))
+
+      // 确保和每个成员都有可用连接：坏的重建，好的保留
+      remoteIds.forEach((id) => ensurePeerConnection(id, { force: staleSessions.has(id) }))
     })
 
     socket.value.on('user-joined', (newUser: User) => {
-      console.log('User joined:', newUser)
-      addUser(newUser)
-      createPeerConnection(newUser.id, true)
+      console.log('[WebRTC] 用户加入:', newUser.id, newUser.name)
+      const { sessionChanged } = upsertUser(newUser)
+      if (sessionChanged) notifyListeners(peerSessionChangedListeners, newUser.id)
+      ensurePeerConnection(newUser.id, { force: sessionChanged })
+    })
+
+    // 对端信令重连成功：状态回灌 + 校验 P2P 连接是否还活着。
+    // 若对端 sessionId 变了（页面刷新），立刻重建，不等 ICE 超时
+    socket.value.on('user-rejoined', (user: User) => {
+      const { sessionChanged } = upsertUser(user)
+      console.log(
+        `[WebRTC] 用户重连: ${user.id} ${user.name}${sessionChanged ? '（页面已重载，立刻重建连接）' : ''}`,
+      )
+      if (sessionChanged) notifyListeners(peerSessionChangedListeners, user.id)
+      ensurePeerConnection(user.id, { force: sessionChanged })
+    })
+
+    // 对端信令掉线（仍在服务端宽限期内）：只标记，不销毁连接
+    socket.value.on('user-offline', ({ id }: { id: string }) => {
+      const user = users.get(id)
+      if (user) user.reconnecting = true
     })
 
     socket.value.on('user-left', (userId: string) => {
+      console.log('[WebRTC] 用户离开:', userId)
       removeUser(userId)
     })
 
+    // 对端要求重建连接（它那侧判定连接已不可用）
+    socket.value.on('peer-reset', ({ sender }: { sender: string }) => {
+      if (!users.has(sender)) return
+      const state = peerNegotiations.get(sender)
+      // 防抖：双方同时判定需要重建时，忽略刚建好的连接上的重置请求
+      if (state && Date.now() - state.createdAt < PEER_RESET_DEBOUNCE_MS) return
+      console.log(`[WebRTC] 收到 ${sender} 的重建请求`)
+      createPeerConnection(sender)
+    })
+
     socket.value.on('offer', async ({ sdp, sender }) => {
-      await handleOffer(sender, sdp)
+      await handleRemoteDescription(sender, sdp)
     })
 
     socket.value.on('answer', async ({ sdp, sender }) => {
-      await handleAnswer(sender, sdp)
+      await handleRemoteDescription(sender, sdp)
     })
 
     socket.value.on('ice-candidate', async ({ candidate, sender }) => {
@@ -244,28 +523,7 @@ export function useWebRTC(roomId: string, userName: string) {
     socket.value.on('user-update', (data: Partial<User> & { id: string }) => {
       const user = users.get(data.id)
       if (user) {
-        Object.assign(user, data)
-
-        reorganizeStreams(user)
-
-        // 根据状态强制清洗媒体流，保证UI更新
-        if (data.camOpen === false && user.stream) {
-          // 只清理视频轨道，保留音频轨道（因为可能开着麦克风）
-          user.stream.getVideoTracks().forEach((t) => t.stop())
-          // 只有当没有活跃轨道时才置空
-          if (!user.stream.getTracks().some((t) => t.readyState === 'live')) {
-            user.stream = undefined
-          }
-        }
-        // 修复说话状态残留: 如果对方关闭麦克风，强制重置说话状态
-        if (data.micOpen === false) {
-          user.isSpeaking = false
-          user.audioLevel = 0
-        }
-        if (data.isScreenSharing === false && user.screenStream) {
-          user.screenStream.getTracks().forEach((t) => t.stop())
-          user.screenStream = undefined
-        }
+        applyRemoteUserState(user, pickRemoteState(data))
       }
     })
   }
@@ -293,25 +551,162 @@ export function useWebRTC(roomId: string, userName: string) {
     })
   }
 
-  const addUser = (userData: User) => {
-    if (!users.has(userData.id)) {
-      users.set(userData.id, {
-        ...userData,
-        connected: false,
-        stream: undefined,
-        screenStream: undefined,
-      })
+  // 服务端会下发的状态字段（不含本地持有的媒体流与连接状态）
+  const REMOTE_STATE_FIELDS = [
+    'name',
+    'joinTime',
+    'micOpen',
+    'camOpen',
+    'isScreenSharing',
+    'isSpeaking',
+    'audioLevel',
+    'camStreamId',
+    'screenStreamId',
+    'isDesktop',
+    'sessionId',
+  ] as const
+
+  // 只挑出真正下发了的字段，避免用 undefined 覆盖掉本地已有状态
+  const pickRemoteState = (source: Partial<User>): Partial<User> => {
+    const patch: Record<string, unknown> = {}
+    for (const field of REMOTE_STATE_FIELDS) {
+      const value = (source as Record<string, unknown>)[field]
+      if (value !== undefined) patch[field] = value
+    }
+    return patch as Partial<User>
+  }
+
+  /**
+   * 把远端状态合并到本地用户对象上，并按状态清洗残留的媒体流。
+   * user-update 与 room-users / user-rejoined 的状态重同步都走这里，
+   * 保证「重连后开关状态不同步」的问题不会因为走了不同分支而复现。
+   */
+  const applyRemoteUserState = (user: User, patch: Partial<User>) => {
+    Object.assign(user, patch)
+
+    reorganizeStreams(user)
+
+    // 根据状态强制清洗媒体流，保证UI更新
+    if (patch.camOpen === false && user.stream) {
+      // 只清理视频轨道，保留音频轨道（因为可能开着麦克风）
+      user.stream.getVideoTracks().forEach((t) => t.stop())
+      // 只有当没有活跃轨道时才置空
+      if (!user.stream.getTracks().some((t) => t.readyState === 'live')) {
+        user.stream = undefined
+      }
+    }
+    // 修复说话状态残留: 如果对方关闭麦克风，强制重置说话状态
+    if (patch.micOpen === false) {
+      user.isSpeaking = false
+      user.audioLevel = 0
+    }
+    if (patch.isScreenSharing === false && user.screenStream) {
+      user.screenStream.getTracks().forEach((t) => t.stop())
+      user.screenStream = undefined
     }
   }
 
-  const removeUser = (userId: string) => {
-    users.delete(userId)
-    peerAudioTrackOverrides.delete(userId)
-    const pc = peers.get(userId)
-    if (pc) {
-      pc.close()
-      peers.delete(userId)
+  /**
+   * 新增或更新用户。
+   * 之前这里在用户已存在时直接 return，导致重连后收到的 room-users 快照被丢弃，
+   * 对端的麦克风/摄像头状态一直停留在断线前的旧值。
+   *
+   * 返回 sessionChanged：对端页面重新加载过，此时本地那条 PeerConnection
+   * 必然已经失效，调用方应立刻强制重建而不是等 ICE 超时。
+   */
+  const upsertUser = (userData: Partial<User> & { id: string }) => {
+    const existing = users.get(userData.id)
+
+    if (!existing) {
+      users.set(userData.id, {
+        micOpen: false,
+        camOpen: false,
+        isScreenSharing: false,
+        joinTime: Date.now(),
+        name: '',
+        ...userData,
+        connected: false,
+        reconnecting: false,
+        stream: undefined,
+        screenStream: undefined,
+      })
+      return { isNew: true, sessionChanged: false }
     }
+
+    const sessionChanged = Boolean(
+      userData.sessionId && existing.sessionId && userData.sessionId !== existing.sessionId,
+    )
+
+    if (sessionChanged) {
+      // 上个会话的流已经彻底失效，立刻丢掉，避免界面卡在最后一帧
+      existing.stream?.getTracks().forEach((t) => t.stop())
+      existing.screenStream?.getTracks().forEach((t) => t.stop())
+      existing.stream = undefined
+      existing.screenStream = undefined
+      existing.connected = false
+    }
+
+    // 已存在：只覆盖状态字段，保留已经收到的媒体流与真实连接状态
+    applyRemoteUserState(existing, { ...pickRemoteState(userData), reconnecting: false })
+
+    return { isNew: false, sessionChanged }
+  }
+
+  const clearPeerRecoveryTimer = (targetId: string) => {
+    const state = peerNegotiations.get(targetId)
+    if (state?.recoveryTimer) {
+      clearTimeout(state.recoveryTimer)
+      state.recoveryTimer = null
+    }
+  }
+
+  /**
+   * 彻底销毁与某个对端的 PeerConnection。
+   * 注意：同传的音轨（peerAudioTrackOverrides.track）要保留，
+   * 只清掉与旧 PeerConnection 绑定的 sender 引用，重建时会重新 addTrack。
+   */
+  const destroyPeer = (targetId: string) => {
+    clearPeerRecoveryTimer(targetId)
+    peerNegotiations.delete(targetId)
+    peerMicrophoneSenders.delete(targetId)
+
+    const override = peerAudioTrackOverrides.get(targetId)
+    if (override) {
+      override.sender = null
+      override.originalMaxBitrates = null
+    }
+
+    const pc = peers.get(targetId)
+    if (pc) {
+      pendingCandidates.delete(targetId)
+      pc.onnegotiationneeded = null
+      pc.onicecandidate = null
+      pc.oniceconnectionstatechange = null
+      pc.onconnectionstatechange = null
+      pc.ontrack = null
+      try {
+        pc.close()
+      } catch (e) {
+        console.warn('[WebRTC] 关闭 PeerConnection 失败:', e)
+      }
+      peers.delete(targetId)
+    }
+
+    const user = users.get(targetId)
+    if (user) user.connected = false
+  }
+
+  const removeUser = (userId: string) => {
+    if (!users.has(userId)) return
+
+    // 先通知上层：此时 users 与 override 都还在，监听者可以完成自己的清理。
+    // 同传依赖这个回调停掉 Gemini 会话并把音轨换回麦克风，否则对端离开后会一直计费。
+    notifyListeners(peerRemovedListeners, userId)
+
+    destroyPeer(userId)
+    pendingCandidates.delete(userId)
+    peerAudioTrackOverrides.delete(userId)
+    users.delete(userId)
   }
 
   // 优化屏幕共享发送端参数，提高画质和流畅度
@@ -336,14 +731,51 @@ export function useWebRTC(roomId: string, userName: string) {
     }
   }
 
-  const createPeerConnection = async (targetId: string, isInitiator: boolean) => {
-    if (peers.has(targetId)) return peers.get(targetId)
+  // ID 字典序决定 polite 角色，保证同一对用户双方结论必然相反
+  const isPolitePeer = (targetId: string) => localUser.id < targetId
 
+  const isPeerUsable = (pc: RTCPeerConnection | undefined) => {
+    if (!pc) return false
+    if (pc.signalingState === 'closed') return false
+    return (
+      pc.connectionState === 'new' ||
+      pc.connectionState === 'connecting' ||
+      pc.connectionState === 'connected'
+    )
+  }
+
+  /**
+   * 创建与某个对端的 PeerConnection（内部会先销毁旧连接）。
+   *
+   * 原实现是 `if (peers.has(targetId)) return peers.get(targetId)`，
+   * 断线重连后对端会以「新用户」身份重新发 offer，而本地这个 ID 对应的
+   * PeerConnection 还是断线前那个 failed 状态的旧对象，于是 offer 被灌进
+   * 一个永远不可能再连上的连接里 —— 这就是「用户列表能显示、
+   * 但音视频连不上、状态一直是连接中」的根因。
+   */
+  const createPeerConnection = (targetId: string) => {
+    destroyPeer(targetId)
+
+    const polite = isPolitePeer(targetId)
     const pc = new RTCPeerConnection(ICE_SERVERS)
+    const state: PeerNegotiationState = {
+      pc,
+      polite,
+      makingOffer: false,
+      ignoreOffer: false,
+      isSettingRemoteAnswerPending: false,
+      createdAt: Date.now(),
+      recoveryAttempts: 0,
+      recoveryTimer: null,
+    }
     peers.set(targetId, pc)
+    peerNegotiations.set(targetId, state)
+
+    console.log(`[WebRTC] 建立 PeerConnection -> ${targetId} (polite=${polite})`)
 
     // 创建 DataChannel 以确保即使没有音视频流也能建立连接
-    if (isInitiator) {
+    // 只由 impolite 一侧创建，避免双方同时创建产生多余协商
+    if (!polite) {
       pc.createDataChannel('keepalive')
     }
 
@@ -352,14 +784,25 @@ export function useWebRTC(roomId: string, userName: string) {
     const audioOverride = peerAudioTrackOverrides.get(targetId)
     originLocalStream.getTracks().forEach((track) => {
       if (track.kind === 'audio' && audioOverride) return
-      pc.addTrack(track, originLocalStream)
+      const sender = pc.addTrack(track, originLocalStream)
+      if (track.kind === 'audio') peerMicrophoneSenders.set(targetId, sender)
     })
     if (audioOverride?.track) {
       const sender = pc.addTrack(audioOverride.track, originLocalStream)
       audioOverride.sender = sender
+      peerMicrophoneSenders.set(targetId, sender)
       audioOverride.originalMaxBitrates = sender
         .getParameters()
         .encodings.map((encoding) => encoding.maxBitrate)
+      // 重建后要重新施加码率上限，否则译音轨会按默认码率发送
+      void applyOverrideBitrate(sender, audioOverride.preferredMaxBitrate)
+    }
+    if (!peerMicrophoneSenders.has(targetId)) {
+      const audioTransceiver = pc.addTransceiver('audio', {
+        direction: 'sendrecv',
+        streams: [originLocalStream],
+      })
+      peerMicrophoneSenders.set(targetId, audioTransceiver.sender)
     }
 
     // 如果正在屏幕共享，也添加屏幕流
@@ -373,18 +816,22 @@ export function useWebRTC(roomId: string, userName: string) {
     }
 
     // 监听协商事件 (处理动态添加/移除轨道)
+    // Perfect Negotiation：不再因为 signalingState 不稳定就直接放弃，
+    // 否则开关摄像头/麦克风的变更会被静默丢弃，永远同步不到对端
     pc.onnegotiationneeded = async () => {
+      if (peers.get(targetId) !== pc) return
       try {
-        // 避免在非稳定状态下进行协商
-        if (pc.signalingState !== 'stable') return
-        const offer = await pc.createOffer()
-        await pc.setLocalDescription(offer)
+        state.makingOffer = true
+        await pc.setLocalDescription()
+        if (peers.get(targetId) !== pc || !pc.localDescription) return
         socket.value?.emit('offer', {
           target: targetId,
-          sdp: offer,
+          sdp: pc.localDescription,
         })
       } catch (e) {
-        console.error('Negotiation failed:', e)
+        console.error(`[WebRTC] 创建 offer 失败 (${targetId}):`, e)
+      } finally {
+        state.makingOffer = false
       }
     }
 
@@ -397,29 +844,12 @@ export function useWebRTC(roomId: string, userName: string) {
       }
     }
 
-    // 监听 ICE 连接状态，自动重启 ICE
-    pc.oniceconnectionstatechange = async () => {
-      console.log(`ICE connection state change for ${targetId}: ${pc.iceConnectionState}`)
+    // 监听 ICE 连接状态，交由统一的恢复流程处理
+    pc.oniceconnectionstatechange = () => {
+      console.log(`[WebRTC] ICE 状态 ${targetId}: ${pc.iceConnectionState}`)
+      if (peers.get(targetId) !== pc) return
       if (pc.iceConnectionState === 'failed') {
-        console.log('ICE failed, attempting restart...')
-        // 只有发起者尝试重启，避免冲突
-        if (isInitiator) {
-          try {
-            // 确保在 stable 状态下才能进行重启操作，或者至少尝试
-            if (pc.signalingState !== 'stable') {
-              console.warn('Signaling state is not stable, postponing ICE restart')
-              return
-            }
-            const offer = await pc.createOffer({ iceRestart: true })
-            await pc.setLocalDescription(offer)
-            socket.value?.emit('offer', {
-              target: targetId,
-              sdp: offer,
-            })
-          } catch (e) {
-            console.error('ICE restart failed:', e)
-          }
-        }
+        schedulePeerRecovery(targetId, 0)
       }
     }
 
@@ -471,57 +901,231 @@ export function useWebRTC(roomId: string, userName: string) {
     }
 
     pc.onconnectionstatechange = () => {
+      if (peers.get(targetId) !== pc) return
+      console.log(`[WebRTC] 连接状态 ${targetId}: ${pc.connectionState}`)
+
       const user = users.get(targetId)
       if (user) {
         user.connected = pc.connectionState === 'connected'
       }
+
+      switch (pc.connectionState) {
+        case 'connected':
+          state.recoveryAttempts = 0
+          clearPeerRecoveryTimer(targetId)
+          break
+        case 'disconnected':
+          // 可能是短暂抖动，先等一会看是否自愈
+          schedulePeerRecovery(targetId, DISCONNECTED_RECOVERY_DELAY_MS)
+          break
+        case 'failed':
+          schedulePeerRecovery(targetId, 0)
+          break
+      }
     }
 
-    if (isInitiator) {
-      // 移除手动创建 Offer，完全依赖 onnegotiationneeded
-      // pc.createDataChannel 在上面已经调用，会触发 onnegotiationneeded
-    }
+    // 兜底看门狗：连接一直停在 new / connecting（协商消息丢失等）时主动重试，
+    // 避免 UI 永远停留在「连接中」
+    schedulePeerRecovery(targetId, PEER_CONNECT_TIMEOUT_MS)
 
     return pc
   }
 
-  const handleOffer = async (senderId: string, sdp: RTCSessionDescriptionInit) => {
-    const pc = await createPeerConnection(senderId, false)
-    if (!pc) return
+  /**
+   * 确保与某个对端存在「可用」的连接。
+   * 已有连接但处于 failed / closed / disconnected 时会协同对端一起重建。
+   *
+   * force：对端 sessionId 变化（页面重新加载）时用，绕过健康检查直接重建。
+   * 因为此时本地连接的 connectionState 往往还停留在 connected，
+   * 光看状态要等 ICE 超时才能发现，那正是重连要等十几秒的原因。
+   */
+  const ensurePeerConnection = (targetId: string, options?: { force?: boolean }) => {
+    if (targetId === localUser.id) return
+    if (!users.has(targetId)) return
 
-    await pc.setRemoteDescription(new RTCSessionDescription(sdp))
-    const answer = await pc.createAnswer()
-    await pc.setLocalDescription(answer)
+    const pc = peers.get(targetId)
+    if (!options?.force && isPeerUsable(pc)) return
 
-    socket.value?.emit('answer', {
-      target: senderId,
-      sdp: answer,
-    })
+    if (pc) {
+      resetPeerConnection(targetId)
+      return
+    }
+    createPeerConnection(targetId)
   }
 
-  const handleAnswer = async (senderId: string, sdp: RTCSessionDescriptionInit) => {
-    const pc = peers.get(senderId)
-    if (pc) {
-      await pc.setRemoteDescription(new RTCSessionDescription(sdp))
+  /** 通知对端一起销毁重建，然后本地重建 */
+  const resetPeerConnection = (targetId: string) => {
+    if (!users.has(targetId)) return
+    console.log(`[WebRTC] 重建与 ${targetId} 的连接`)
+    socket.value?.emit('peer-reset', { target: targetId })
+    createPeerConnection(targetId)
+  }
+
+  const schedulePeerRecovery = (targetId: string, delay: number) => {
+    const state = peerNegotiations.get(targetId)
+    if (!state || state.recoveryTimer) return
+    state.recoveryTimer = setTimeout(() => {
+      state.recoveryTimer = null
+      void recoverPeer(targetId)
+    }, delay)
+  }
+
+  /**
+   * 连接异常时的分级恢复：先尝试有限次 ICE 重启，无效再彻底重建连接。
+   * 彻底重建优先由 impolite 一侧发起，polite 一侧多等几轮兜底，
+   * 避免双方同时重建导致来回抖动。
+   */
+  const recoverPeer = async (targetId: string) => {
+    const state = peerNegotiations.get(targetId)
+    if (!state || !users.has(targetId)) return
+
+    const pc = state.pc
+    if (peers.get(targetId) !== pc) return
+    if (pc.connectionState === 'connected' || pc.signalingState === 'closed') return
+
+    // 信令不通时无法协商，保持排队等信令恢复后再试（不消耗重试次数）
+    if (!socket.value?.connected) {
+      schedulePeerRecovery(targetId, RECOVERY_RETRY_DELAY_MS)
+      return
+    }
+
+    if (state.recoveryAttempts < MAX_ICE_RESTARTS) {
+      state.recoveryAttempts++
+      console.log(`[WebRTC] 尝试 ICE 重启 ${targetId} (第 ${state.recoveryAttempts} 次)`)
+      try {
+        if (typeof pc.restartIce === 'function') {
+          // 会触发 onnegotiationneeded，由 Perfect Negotiation 完成重新协商
+          pc.restartIce()
+        } else if (!state.polite) {
+          const offer = await pc.createOffer({ iceRestart: true })
+          await pc.setLocalDescription(offer)
+          socket.value?.emit('offer', { target: targetId, sdp: pc.localDescription })
+        }
+      } catch (e) {
+        console.warn(`[WebRTC] ICE 重启失败 (${targetId}):`, e)
+      }
+      schedulePeerRecovery(targetId, RECOVERY_RETRY_DELAY_MS)
+      return
+    }
+
+    // polite 一侧再多等两轮，等 impolite 一侧的 peer-reset
+    if (state.polite && state.recoveryAttempts < MAX_ICE_RESTARTS + 2) {
+      state.recoveryAttempts++
+      schedulePeerRecovery(targetId, RECOVERY_RETRY_DELAY_MS)
+      return
+    }
+
+    resetPeerConnection(targetId)
+  }
+
+  const flushPendingCandidates = async (senderId: string, pc: RTCPeerConnection) => {
+    const queued = pendingCandidates.get(senderId)
+    if (!queued?.length) return
+    pendingCandidates.delete(senderId)
+    for (const candidate of queued) {
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate(candidate))
+      } catch (e) {
+        console.warn(`[WebRTC] 补发 ICE 候选失败 (${senderId}):`, e)
+      }
+    }
+  }
+
+  /**
+   * 统一处理 offer / answer（Perfect Negotiation）。
+   * 冲突时 polite 一侧靠 setRemoteDescription 的隐式回滚让路，
+   * impolite 一侧直接忽略对端 offer，从而不会出现双方都卡住的情况。
+   */
+  const handleRemoteDescription = async (
+    senderId: string,
+    description: RTCSessionDescriptionInit,
+  ) => {
+    if (senderId === localUser.id) return
+
+    if (!users.has(senderId)) {
+      // 信令乱序兜底：offer 比 room-users / user-joined 先到时先占位，
+      // 后续的成员信息会覆盖掉这里的占位值，避免直接丢弃 offer 导致连接建不起来
+      if (description.type !== 'offer') return
+      upsertUser({ id: senderId, name: '' })
+    }
+
+    let state = peerNegotiations.get(senderId)
+    if (!state || peers.get(senderId) !== state.pc) {
+      // 只有 offer 才允许触发新建连接，迟到的 answer 直接丢弃
+      if (description.type !== 'offer') return
+      createPeerConnection(senderId)
+      state = peerNegotiations.get(senderId)
+      if (!state) return
+    }
+
+    const pc = state.pc
+
+    try {
+      const readyForOffer =
+        !state.makingOffer && (pc.signalingState === 'stable' || state.isSettingRemoteAnswerPending)
+      const offerCollision = description.type === 'offer' && !readyForOffer
+
+      state.ignoreOffer = !state.polite && offerCollision
+      if (state.ignoreOffer) {
+        console.log(`[WebRTC] 忽略来自 ${senderId} 的冲突 offer (impolite)`)
+        return
+      }
+
+      if (description.type === 'answer' && pc.signalingState !== 'have-local-offer') {
+        // 过期的 answer（例如刚刚回滚过），忽略即可
+        return
+      }
+
+      state.isSettingRemoteAnswerPending = description.type === 'answer'
+      await pc.setRemoteDescription(new RTCSessionDescription(description))
+      state.isSettingRemoteAnswerPending = false
+
+      if (peers.get(senderId) !== pc) return
+      await flushPendingCandidates(senderId, pc)
+
+      if (description.type === 'offer') {
+        await pc.setLocalDescription()
+        if (peers.get(senderId) !== pc || !pc.localDescription) return
+        socket.value?.emit('answer', {
+          target: senderId,
+          sdp: pc.localDescription,
+        })
+      }
+    } catch (e) {
+      state.isSettingRemoteAnswerPending = false
+      console.error(`[WebRTC] 处理 ${description.type} 失败 (${senderId}):`, e)
     }
   }
 
   const handleCandidate = async (senderId: string, candidate: RTCIceCandidateInit) => {
-    const pc = peers.get(senderId)
-    if (pc) {
-      await pc.addIceCandidate(new RTCIceCandidate(candidate))
+    const state = peerNegotiations.get(senderId)
+
+    // 连接不存在 / 已被重建 / remoteDescription 还没设上时都不能直接 addIceCandidate，先缓存
+    if (!state || peers.get(senderId) !== state.pc || !state.pc.remoteDescription) {
+      const queued = pendingCandidates.get(senderId) ?? []
+      queued.push(candidate)
+      pendingCandidates.set(senderId, queued)
+      return
+    }
+
+    try {
+      await state.pc.addIceCandidate(new RTCIceCandidate(candidate))
+    } catch (e) {
+      // 忽略被丢弃的 offer 所对应的候选
+      if (!state.ignoreOffer) {
+        console.warn(`[WebRTC] 添加 ICE 候选失败 (${senderId}):`, e)
+      }
     }
   }
 
   // 开关麦克风
-  const toggleMic = async () => {
+  const applyMicrophoneToggle = async () => {
     if (!localStream.value) return
 
     if (localUser.micOpen) {
       // 关闭：停止轨道并销毁
       const audioTrack = localStream.value.getAudioTracks()[0]
       if (audioTrack) {
-        // 先移除 Sender，避免 track.stop() 后找不到 sender
         // 如果在混音中，断开连接
         if (localUser.isScreenSharing && micSourceNode) {
           micSourceNode.disconnect()
@@ -529,13 +1133,18 @@ export function useWebRTC(roomId: string, userName: string) {
         } else {
           // 只有不在屏幕共享模式下，才去移除 PC 里的 Sender
           // 因为屏幕共享模式下，Audio Track 是混音后的（包含系统音频），不能移除
+          const replacements: Promise<void>[] = []
           peers.forEach((pc, targetId) => {
             if (isPeerAudioTrackOverridden(targetId)) return
-            const sender = pc.getSenders().find((s) => s.track === audioTrack)
+            const sender =
+              getPeerMicrophoneSender(targetId, pc) ??
+              pc.getSenders().find((candidate) => candidate.track === audioTrack)
             if (sender) {
-              pc.removeTrack(sender)
+              peerMicrophoneSenders.set(targetId, sender)
+              replacements.push(sender.replaceTrack(null))
             }
           })
+          await Promise.all(replacements)
         }
 
         audioTrack.stop()
@@ -578,10 +1187,17 @@ export function useWebRTC(roomId: string, userName: string) {
             micSourceNode.connect(mixingDestination)
           } else {
             // 独立发送
+            const replacements: Promise<void>[] = []
             peers.forEach((pc, targetId) => {
               if (isPeerAudioTrackOverridden(targetId)) return
-              pc.addTrack(audioTrack, originLocalStream)
+              const sender = getPeerMicrophoneSender(targetId, pc)
+              if (sender) {
+                replacements.push(sender.replaceTrack(audioTrack))
+              } else {
+                peerMicrophoneSenders.set(targetId, pc.addTrack(audioTrack, originLocalStream))
+              }
             })
+            await Promise.all(replacements)
           }
 
           localStream.value = new MediaStream(originLocalStream.getTracks())
@@ -595,6 +1211,15 @@ export function useWebRTC(roomId: string, userName: string) {
     }
 
     socket.value?.emit('update-status', { roomId, status: { micOpen: localUser.micOpen } })
+  }
+
+  let microphoneToggleOperation: Promise<void> = Promise.resolve()
+  const toggleMic = () => {
+    const nextOperation = microphoneToggleOperation
+      .catch(() => undefined)
+      .then(applyMicrophoneToggle)
+    microphoneToggleOperation = nextOperation
+    return nextOperation
   }
 
   // 辅助函数：获取流并带有重试逻辑
@@ -1046,9 +1671,33 @@ export function useWebRTC(roomId: string, userName: string) {
 
   const cleanup = () => {
     stopSpeakingDetection()
+
+    peerNegotiations.forEach((_, targetId) => clearPeerRecoveryTimer(targetId))
+
     localStream.value?.getTracks().forEach((t) => t.stop())
     localScreenStream.value?.getTracks().forEach((t) => t.stop())
-    peers.forEach((pc) => pc.close())
+    localScreenShareFinalStream.value?.getTracks().forEach((t) => t.stop())
+
+    peers.forEach((pc) => {
+      try {
+        pc.close()
+      } catch (e) {
+        console.warn('[WebRTC] 关闭 PeerConnection 失败:', e)
+      }
+    })
+    peers.clear()
+    peerNegotiations.clear()
+    pendingCandidates.clear()
+    peerMicrophoneSenders.clear()
+    peerAudioTrackOverrides.clear()
+
+    // 主动离开：立即通知服务端移除自己，不占用重连宽限期，
+    // 同时清掉稳定 ID，下次进入同一房间视为新用户
+    if (socket.value?.connected) {
+      socket.value.emit('leave-room', { roomId })
+    }
+    clearStableUserId(roomId)
+
     socket.value?.disconnect()
   }
 
@@ -1058,6 +1707,12 @@ export function useWebRTC(roomId: string, userName: string) {
     localUser,
     users,
     peers,
+    signalingConnected,
+    isReconnecting,
+    onPeerSessionChanged,
+    onPeerRemoved,
+    onSignalingLost,
+    onSignalingRestored,
     reservePeerAudioTrackOverride,
     setPeerAudioTrackOverride,
     clearPeerAudioTrackOverride,

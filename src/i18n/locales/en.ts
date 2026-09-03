@@ -25,6 +25,7 @@ export default {
     screenOf: "{name}'s screen",
     leaveConfirm: 'Recording in progress. Discard?',
     unknownUser: 'Unknown user',
+    signalingLost: 'Connection to the server was lost. Reconnecting…',
   },
   sidebar: {
     members: 'Members',
@@ -34,6 +35,7 @@ export default {
     online: 'Online',
     connected: 'Connected',
     connecting: 'Connecting',
+    reconnecting: 'Reconnecting…',
     messagePlaceholder: 'Type a message...',
     remoteAssist: 'Remote Assist',
   },
@@ -51,6 +53,16 @@ export default {
     captureError: 'Interpretation audio capture failed',
     captionFrom: 'From {name}',
     captionTo: 'To {name}',
+    degraded: {
+      dismiss: 'Dismiss',
+      'peer-reloaded':
+        '{name} reloaded the page. Interpretation stopped — start it again if needed.',
+      'peer-left': '{name} left the room. Interpretation stopped.',
+      'peer-stopped': '{name} is no longer interpreting. Interpretation stopped.',
+      'audio-timeout':
+        'Translated audio from {name} never arrived. Their original audio is back on.',
+      'gemini-failed': 'Interpretation with {name} stopped after repeated connection failures.',
+    },
   },
   settings: {
     title: 'Meeting Summary Settings (LLM)',

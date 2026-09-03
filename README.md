@@ -91,8 +91,8 @@ WebRTCMeeting/
 ## 🚀 快速开始
 
 ### 环境要求
-- **Node.js** 18+ 或更高版本
-- **pnpm** 8+（推荐）或 npm/yarn
+- **Node.js** 22+ 或更高版本
+- **pnpm** 10+（推荐）或 npm/yarn
 - **Rust** 1.70+（仅桌面端开发需要）
 - **Tauri CLI**（仅桌面端开发需要）
 
